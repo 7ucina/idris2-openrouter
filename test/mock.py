@@ -77,6 +77,25 @@ class H(BaseHTTPRequestHandler):
         try: req = json.loads(self.rfile.read(n))
         except Exception: return self.send_json(400, err(400, "body is not JSON"))
         if not self.authed(): return self.send_json(401, err(401, "No auth credentials found"))
+        if self.path == "/api/v1/images":
+            if req.get("model") == "mock/no-image": return self.send_json(400, err(400, "Model cannot make images"))
+            import base64
+            png = bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 255, 254]) + req.get("prompt", "").encode()
+            return self.send_json(200, {"created": 1, "data": [{"b64_json": base64.b64encode(png).decode(), "media_type": "image/png"}] * req.get("n", 1),
+                "usage": {"prompt_tokens": 0, "completion_tokens": 40, "total_tokens": 40, "cost": 0.04}})
+        if self.path == "/api/v1/audio/speech":
+            if req.get("model") == "mock/mute": return self.send_json(402, err(402, "Insufficient credits"))
+            b = bytes(range(256)) * 3 + (req.get("voice", "") + "|" + req.get("response_format", "pcm") + "|" + req.get("input", "")).encode()   # every byte value: not text
+            self.send_response(200); self.send_header("Content-Type", "audio/mpeg"); self.send_header("Content-Length", str(len(b))); self.end_headers()
+            return self.wfile.write(b)
+        if self.path == "/api/v1/audio/transcriptions":
+            import base64
+            a = req.get("input_audio", {})
+            raw = base64.b64decode(a["data"]) if "data" in a else a.get("url", "").encode()
+            out = {"text": "heard %d bytes of %s in %s" % (len(raw), a.get("format"), req.get("language")), "usage": {"seconds": 1.5, "cost": 0.0002}}
+            if req.get("response_format") == "verbose_json":
+                out.update({"language": "english", "duration": 1.5, "segments": [{"id": 0, "start": 0.0, "end": 1.5, "text": "heard"}]})
+            return self.send_json(200, out)
         if self.path == "/api/v1/embeddings":
             vecs = [{"object": "embedding", "index": i, "embedding": [float(len(t)), 0.5, -1e-3]} for i, t in enumerate(req.get("input", []))]
             return self.send_json(200, {"object": "list", "model": req.get("model"), "data": vecs[::-1],   # out of order on purpose
@@ -135,6 +154,18 @@ class H(BaseHTTPRequestHandler):
             self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.send_header("Transfer-Encoding", "chunked"); self.end_headers()
             self.chunk(b'data: {"id":"gen-mock-6","choices":[{"index":0,"delta":{"content":"one "}}]}\n\n')
             time.sleep(6); return
+        if m == "mock/media" and stream:       # a reply with a picture, spoken in base64 pieces
+            import base64
+            ev = lambda o: ("data: " + json.dumps(o) + "\n\n").encode()
+            c = lambda delta, fin=None: {"id": "gen-mock-9", "model": m, "choices": [{"index": 0, "delta": delta, "finish_reason": fin}]}
+            a = req.get("audio", {})
+            say = lambda b, t: {"audio": {"data": base64.b64encode(b).decode(), "transcript": t}}
+            return self.sse([ev(c({"content": "Here. "})), ev(c(say(b"RIFF\x00", "Hello "))), ev(c(say(b"\xff\xfe" + a.get("voice", "").encode(), "there"))),
+                ev(c({"images": [{"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(b"\x89PNG\x00pic").decode()}}]})),
+                ev(c({"content": ""}, "stop")), b"data: [DONE]\n\n"])
+        if m == "mock/media":
+            return self.send_json(200, {"id": "gen-mock-9", "model": m, "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "A cat.",
+                "images": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}}, {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}}]}}]})
         if m == "mock/stream-n2" and stream:   # two choices, interleaved, CRLF line ends, no [DONE]
             ev = lambda o: ("data: " + json.dumps(o) + "\r\n\r\n").encode()
             c = lambda i, delta, fin=None: {"id": "gen-mock-7", "model": m, "choices": [{"index": i, "delta": delta, "finish_reason": fin}]}

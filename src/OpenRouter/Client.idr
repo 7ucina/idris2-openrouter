@@ -7,6 +7,7 @@ module OpenRouter.Client
 
 import Data.IORef
 import Data.List
+import Data.List1
 import Data.Maybe
 import Data.So
 import Data.String
@@ -127,7 +128,7 @@ httpRequest c stream method path query body = MkRequest
   , headers  = (if c.apiKey == "" then [] else [("Authorization", "Bearer " ++ c.apiKey)])
             ++ (if isJust body then [("Content-Type", "application/json")] else [])
             ++ [("Accept", if stream then "text/event-stream" else "application/json")]
-            ++ [("User-Agent", "idris2-openrouter/0.1.0")]
+            ++ [("User-Agent", "idris2-openrouter/0.2.0")]
             ++ maybe [] (\u => [("HTTP-Referer", u)]) c.appUrl
             ++ maybe [] (\t => [("X-Title", t)]) c.appTitle
             ++ c.headers
@@ -385,6 +386,90 @@ completeStream c r onText = do
 export covering
 embed : HasIO io => Client -> EmbeddingRequest -> io (Either Error EmbeddingResponse)
 embed c r = map embeddingResponseFromJSON <$> call c POST "/embeddings" [] (Just (toJSON r))
+
+--------------------------------------------------------------------------------
+-- Images
+--------------------------------------------------------------------------------
+
+||| Make images from a prompt, with a model built for it (the catalog lists
+||| them under `[("output_modalities", "image")]`). Chat models that draw
+||| return their pictures in the reply instead: see `replyImages`.
+export covering
+generateImage : HasIO io => Client -> ImageRequest -> io (Either Error ImageResponse)
+generateImage c r = map imageResponseFromJSON <$> call c POST "/images" [] (Just (toJSON r))
+
+||| Decode base64 data, such as a `GeneratedImage` or `SpokenAudio` holds,
+||| into a file. The result is the number of bytes written, or `Nothing`
+||| when the data is not base64 or the file cannot be written.
+export
+saveBase64 : HasIO io => (path : String) -> (base64 : String) -> io (Maybe Nat)
+saveBase64 = writeBase64
+
+||| Save a `data:...;base64,...` URI, such as `replyImages` returns, to a file.
+export
+saveDataURI : HasIO io => (path : String) -> (uri : String) -> io (Maybe Nat)
+saveDataURI path uri = case fromDataURI uri of
+  Just (_, payload) => writeBase64 path payload
+  Nothing           => pure Nothing
+
+||| A file as a data URI of the given media type, to send as an `Image`, a
+||| `File` or one of the `References`. `Nothing` when the file cannot be read.
+export
+fileDataURI : HasIO io => (mediaType : String) -> (path : String) -> io (Maybe String)
+fileDataURI mediaType path = map (dataURI mediaType) <$> readBase64 path
+
+--------------------------------------------------------------------------------
+-- Speech
+--------------------------------------------------------------------------------
+
+||| Read a text aloud into a file: mp3 with `SpeechFormat "mp3"`, otherwise
+||| headerless 16-bit PCM. The result is the number of bytes written.
+export covering
+speech : HasIO io => Client -> SpeechRequest -> (path : String) -> io (Either Error Nat)
+speech c r path = retrying c.retries c.backoff $ do
+  Right resp <- send (httpRequest c False POST "/audio/speech" [] (Just (toJSON r)))
+    | Left f => pure (Left (Transport f))
+  kind <- header resp "Content-Type"
+  if status resp >= 200 && status resp < 300 && maybe True (not . isInfixOf "json" . toLower) kind
+     then do
+       n <- save resp path
+       close resp
+       pure (mapFst Transport n)
+     else do
+       -- not audio: an error, as JSON
+       after <- retryAfter resp
+       b     <- rest resp
+       close resp
+       pure $ case b of
+         Left f     => Left (Transport f)
+         Right text => case interpret (status resp) after text of
+           Left e  => Left e
+           Right _ => Left (Malformed "expected audio" text)
+
+||| Wrap headerless 16-bit PCM in a WAV file, which players and
+||| transcription models accept. `speech` without `SpeechFormat "mp3"`, and a
+||| spoken chat reply in `"pcm16"`, are headerless PCM: mono, and 24000
+||| samples a second from most providers. The result is the WAV file's size,
+||| or `Nothing` on failure.
+export
+saveWav : HasIO io => (pcmPath : String) -> (wavPath : String) -> (sampleRate : Nat) -> io (Maybe Nat)
+saveWav pcm wav rate = pcmToWav pcm wav rate 1
+
+||| A file as audio to transcribe or to send in a chat message. The format
+||| is the file's extension. `Nothing` when the file cannot be read.
+export
+audioFile : HasIO io => (path : String) -> io (Maybe AudioSource)
+audioFile path = map (\b => AudioData b extension) <$> readBase64 path
+  where
+    extension : String
+    extension = case split (== '.') path of
+      (_ ::: [])   => "wav"
+      (_ ::: rest) => toLower (last ("wav" :: rest))
+
+||| Turn speech into text.
+export covering
+transcribe : HasIO io => Client -> TranscriptionRequest -> io (Either Error Transcription)
+transcribe c r = map transcriptionFromJSON <$> call c POST "/audio/transcriptions" [] (Just (toJSON r))
 
 --------------------------------------------------------------------------------
 -- The catalog

@@ -1,5 +1,5 @@
 package openrouter-examples
-version = 0.1.0
+version = 0.2.0
 brief   = "Example programs for the openrouter package"
 depends = base, openrouter
 

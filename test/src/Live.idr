@@ -1,11 +1,12 @@
 ||| The client against openrouter.ai. The catalog endpoints need no key and
-||| cost nothing. A dozen small paid requests (well under a cent in all) run
-||| only when OPENROUTER_API_KEY is set.
+||| cost nothing. About twenty small paid requests (around a cent in all, most
+||| of it one generated image) run only when OPENROUTER_API_KEY is set.
 module Live
 
 import Data.IORef
 import Data.List
 import Data.Maybe
+import Data.Nat
 import Data.String
 import Harness
 import OpenRouter
@@ -108,6 +109,32 @@ liveTests = do
          [a, b, t] => length a > 100 && length a == length b && dot a b > dot a t
          _         => False
        Left _ => False)
+
+  let out = "test/build/live"
+  r <- speech c (speechRequest "heygen/heygen-voice-1-turbo:free" "The quick brown fox jumps over the lazy dog." [Voice "nadine"]) (out ++ ".pcm")
+  check ("speech is written to a file: " ++ either show show r) (either (const False) (> 20000) r)
+  w <- saveWav (out ++ ".pcm") (out ++ ".wav") 24000
+  check "and wrapped as WAV" (w == map (+ 44) (either (const Nothing) Just r))
+  Just heard <- audioFile (out ++ ".wav")
+    | Nothing => check "the WAV file is read back" False
+  t <- transcribe c (transcriptionRequest "openai/gpt-4o-mini-transcribe" heard [Language "en"])
+  check ("and transcribed: " ++ either show (.text) t) (either (const False) (isInfixOf "quick brown fox" . toLower . (.text)) t)
+
+  s <- chatStream c (chatRequest "openai/gpt-audio-mini" ["Say exactly: hello from Idris."] (spoken "alloy" "pcm16" ++ [MaxTokens 200])) (\_ => pure ())
+  check ("a spoken chat reply: " ++ either show (maybe "no audio" transcript . replyAudio) s)
+    (either (const False) (maybe False (\a => isInfixOf "hello" (toLower a.transcript) && length a.base64 > 10000) . replyAudio) s)
+  n <- maybe (pure Nothing) (saveBase64 (out ++ "2.pcm") . base64) (either (const Nothing) replyAudio s)
+  check "its audio decodes to whole 16-bit samples" (maybe False (\b => b > 10000 && b `mod` 2 == 0) n)
+
+  i <- generateImage c (imageRequest "recraft/recraft-v4.1-flash-v2" "a small red fox, flat vector illustration" [AspectRatio "1:1"])
+  check ("an image is generated: " ++ either show (show . map mediaType . images) i)
+    (either (const False) (\x => any (\g => length g.base64 > 1000) x.images) i)
+  n <- maybe (pure Nothing) (saveBase64 (out ++ ".img") . base64) (either (const Nothing) (head' . images) i)
+  check "and saved" (maybe False (> 1000) n)
+  Just picture <- fileDataURI "image/webp" (out ++ ".img")
+    | Nothing => check "the image is read back" False
+  v <- chat c (chatRequest mini [userParts [Text "What animal is this? One word.", Image picture]] [MaxTokens 10])
+  check ("and recognized when sent back as input: " ++ either show text v) (either (const False) (isInfixOf "fox" . toLower . text) v)
 
   k <- keyInfo c
   putStrLn ("  key: " ++ either show (\x => x.label ++ ", used $" ++ maybe "?" show x.usage ++ ", limit " ++ maybe "none" show x.limit) k)

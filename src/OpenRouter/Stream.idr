@@ -43,6 +43,12 @@ record Delta where
   logprobs           : List TokenLogprob
   ||| Structured reasoning blocks, kept so the message can be sent back.
   reasoningDetails   : List JSON
+  ||| Images the model made, each as a data URI.
+  images             : List String
+  ||| More of the spoken reply, in base64, or `""`.
+  audioData          : String
+  ||| More of what is being said, or `""`.
+  audioTranscript    : String
 
 public export
 record Chunk where
@@ -79,6 +85,9 @@ deltaFromJSON j =
         (asString (get "native_finish_reason" j))
         (logprobsFromJSON (get "logprobs" j))
         (asList (get "reasoning_details" d))
+        (imageURLs (get "images" d))
+        (fromMaybe "" (asString (path ["audio", "data"] d)))
+        (fromMaybe "" (asString (path ["audio", "transcript"] d)))
 
 export
 chunkFromJSON : JSON -> Chunk
@@ -122,6 +131,9 @@ record PartialChoice where
   native    : Maybe String
   logprobs  : SnocList TokenLogprob
   details   : SnocList JSON
+  images    : SnocList String
+  audio     : SnocList String
+  spoken    : SnocList String
 
 ||| Everything a stream has said so far.
 export
@@ -166,14 +178,17 @@ addCall calls d =
 
 addDelta : List PartialChoice -> Delta -> List PartialChoice
 addDelta choices d =
-  upsert (.index) (\n => MkPartialChoice n [<] [<] [] Nothing Nothing [<] [<]) d.index
+  upsert (.index) (\n => MkPartialChoice n [<] [<] [] Nothing Nothing [<] [<] [<] [<] [<]) d.index
     (\c => { content   $= (:< d.content)
            , reasoning $= (:< d.reasoning)
            , calls     := foldl addCall c.calls d.toolCalls
            , finish    := d.finishReason <|> c.finish
            , native    := d.nativeFinishReason <|> c.native
            , logprobs  $= (<>< d.logprobs)
-           , details   $= (<>< d.reasoningDetails) } c)
+           , details   $= (<>< d.reasoningDetails)
+           , images    $= (<>< d.images)
+           , audio     $= (:< d.audioData)
+           , spoken    $= (:< d.audioTranscript) } c)
     choices
 
 ||| Add a chunk.
@@ -195,6 +210,8 @@ finishChoice c =
       reasoning = concat c.reasoning
       calls     = map finishCall c.calls
       details   = c.details <>> []
+      audio     = concat c.audio
+      spoken    = concat c.spoken
    in MkChoice c.index
         (MkMessage Assistant
            (if content == "" && not (null calls) then Nothing else Just (Plain content))
@@ -204,6 +221,8 @@ finishChoice c =
         (if reasoning == "" then Nothing else Just reasoning)
         Nothing
         (c.logprobs <>> [])
+        (c.images <>> [])
+        (if audio == "" && spoken == "" then Nothing else Just (MkSpokenAudio audio spoken))
         JNull
 
 ||| The response the chunks so far add up to.

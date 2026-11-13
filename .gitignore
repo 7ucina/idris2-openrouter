@@ -5,3 +5,5 @@ support/*.so
 support/*.dll
 _tmppack*
 .DS_Store
+examples/picture.*
+examples/speech.*

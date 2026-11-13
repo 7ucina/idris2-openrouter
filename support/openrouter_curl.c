@@ -261,6 +261,28 @@ const char *or_response_header(or_req *r, const char *name) {
   return r->hv.p ? r->hv.p : "";
 }
 
+// Write the rest of the body to a file, bytes untouched: for responses that
+// are not text. The number of bytes written, or -1 when the file could not
+// be written (the transfer's own failure is reported by or_error).
+long or_save(or_req *r, const char *path) {
+  FILE *f = fopen(path, "wb");
+  if (!f) return -1;
+  long total = 0;
+  int  bad = 0;
+  for (;;) {
+    pump(r, 0);
+    if (r->in.len) {
+      if (fwrite(r->in.p, 1, r->in.len, f) != r->in.len) bad = 1;
+      total += (long)r->in.len;
+      r->in.len = 0;
+      r->in.p[0] = 0;
+    }
+    if (r->done) break;
+  }
+  if (fclose(f) != 0) bad = 1;
+  return bad ? -1 : total;
+}
+
 void or_free(or_req *r) {
   if (!r) return;
   if (r->added) curl_multi_remove_handle(r->multi, r->easy);
@@ -273,4 +295,160 @@ void or_free(or_req *r) {
   free(r->rh.p);
   free(r->hv.p);
   free(r);
+}
+
+// ---- Base64 files: how binary data (images, audio) crosses into JSON.
+
+static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static buf        b64_out;  // the encoding last handed out
+
+// The contents of a file, base64-encoded. NULL-safe for Idris: "" when the
+// file could not be read (see or_file_ok). The string is valid until the
+// next call.
+const char *or_file_base64(const char *path) {
+  b64_out.len = 0;
+  if (b64_out.p) b64_out.p[0] = 0;
+  FILE *f = fopen(path, "rb");
+  if (!f) return "";
+  unsigned char in[3 * 1024];
+  char          out[4 * 1024];
+  size_t        n;
+  while ((n = fread(in, 1, sizeof in, f)) > 0) {
+    size_t o = 0;
+    for (size_t i = 0; i < n; i += 3) {
+      unsigned v = (unsigned)in[i] << 16;
+      if (i + 1 < n) v |= (unsigned)in[i + 1] << 8;
+      if (i + 2 < n) v |= in[i + 2];
+      out[o++] = b64[v >> 18];
+      out[o++] = b64[(v >> 12) & 63];
+      out[o++] = i + 1 < n ? b64[(v >> 6) & 63] : '=';
+      out[o++] = i + 2 < n ? b64[v & 63] : '=';
+    }
+    if (!buf_add(&b64_out, out, o)) break;
+  }
+  int bad = ferror(f);
+  fclose(f);
+  if (bad) {
+    b64_out.len = 0;
+    if (b64_out.p) b64_out.p[0] = 0;
+  }
+  return b64_out.p ? b64_out.p : "";
+}
+
+// 1 when the file exists and can be read.
+int or_file_ok(const char *path) {
+  FILE *f = fopen(path, "rb");
+  if (!f) return 0;
+  fclose(f);
+  return 1;
+}
+
+static int b64_value(unsigned char c) {
+  if (c >= 'A' && c <= 'Z') return c - 'A';
+  if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+  if (c >= '0' && c <= '9') return c - '0' + 52;
+  if (c == '+' || c == '-') return 62;  // the URL-safe alphabet too
+  if (c == '/' || c == '_') return 63;
+  return -1;
+}
+
+// Decode base64 text into a file. Padding ends a group, so pieces that were
+// encoded one by one and then joined decode correctly; whitespace is
+// skipped. The number of bytes written, or -1 when the text is not base64
+// or the file could not be written.
+long or_base64_file(const char *path, const char *text) {
+  FILE *f = fopen(path, "wb");
+  if (!f) return -1;
+  long     total = 0;
+  unsigned acc = 0;
+  int      have = 0, bad = 0;
+  for (const unsigned char *p = (const unsigned char *)text; *p && !bad; p++) {
+    if (*p == '=') {  // flush a short group
+      if (have == 2) {
+        fputc((int)((acc >> 4) & 0xFF), f);
+        total += 1;
+      } else if (have == 3) {
+        fputc((int)((acc >> 10) & 0xFF), f);
+        fputc((int)((acc >> 2) & 0xFF), f);
+        total += 2;
+      } else if (have == 1) {
+        bad = 1;
+      }
+      acc = 0;
+      have = 0;
+      continue;
+    }
+    if (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') continue;
+    int v = b64_value(*p);
+    if (v < 0) {
+      bad = 1;
+      break;
+    }
+    acc = (acc << 6) | (unsigned)v;
+    if (++have == 4) {
+      fputc((int)((acc >> 16) & 0xFF), f);
+      fputc((int)((acc >> 8) & 0xFF), f);
+      fputc((int)(acc & 0xFF), f);
+      total += 3;
+      acc = 0;
+      have = 0;
+    }
+  }
+  if (have == 2) {  // unpadded tail
+    fputc((int)((acc >> 4) & 0xFF), f);
+    total += 1;
+  } else if (have == 3) {
+    fputc((int)((acc >> 10) & 0xFF), f);
+    fputc((int)((acc >> 2) & 0xFF), f);
+    total += 2;
+  } else if (have == 1) {
+    bad = 1;
+  }
+  if (ferror(f)) bad = 1;
+  if (fclose(f) != 0) bad = 1;
+  return bad ? -1 : total;
+}
+
+static void le(unsigned char *p, unsigned long v, int n) {
+  for (int i = 0; i < n; i++) p[i] = (unsigned char)(v >> (8 * i));
+}
+
+// Copy headerless 16-bit little-endian PCM into a WAV file, which players
+// and transcription models accept. The number of bytes written, or -1.
+long or_pcm_to_wav(const char *pcm_path, const char *wav_path, int rate, int channels) {
+  FILE *in = fopen(pcm_path, "rb");
+  if (!in) return -1;
+  if (fseek(in, 0, SEEK_END) != 0) {
+    fclose(in);
+    return -1;
+  }
+  long size = ftell(in);
+  rewind(in);
+  FILE *out = size < 0 ? NULL : fopen(wav_path, "wb");
+  if (!out) {
+    fclose(in);
+    return -1;
+  }
+  unsigned char h[44];
+  memcpy(h, "RIFF", 4);
+  le(h + 4, (unsigned long)size + 36, 4);
+  memcpy(h + 8, "WAVEfmt ", 8);
+  le(h + 16, 16, 4);                                    // size of the format block
+  le(h + 20, 1, 2);                                     // PCM
+  le(h + 22, (unsigned long)channels, 2);
+  le(h + 24, (unsigned long)rate, 4);
+  le(h + 28, (unsigned long)rate * channels * 2, 4);    // bytes per second
+  le(h + 32, (unsigned long)channels * 2, 2);           // bytes per frame
+  le(h + 34, 16, 2);                                    // bits per sample
+  memcpy(h + 36, "data", 4);
+  le(h + 40, (unsigned long)size, 4);
+  int    bad = fwrite(h, 1, sizeof h, out) != sizeof h;
+  char   chunk[65536];
+  size_t n;
+  while (!bad && (n = fread(chunk, 1, sizeof chunk, in)) > 0)
+    if (fwrite(chunk, 1, n, out) != n) bad = 1;
+  if (ferror(in)) bad = 1;
+  fclose(in);
+  if (fclose(out) != 0) bad = 1;
+  return bad ? -1 : size + 44;
 }

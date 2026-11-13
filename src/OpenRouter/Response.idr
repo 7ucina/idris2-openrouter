@@ -203,6 +203,16 @@ logprobsFromJSON j = mapMaybe one (asList (get "content" j))
     one t = [| MkTokenLogprob (asString (get "token" t)) (asDouble (get "logprob" t))
                               (pure (mapMaybe alt (asList (get "top_logprobs" t)))) |]
 
+||| Audio a chat model spoke.
+public export
+record SpokenAudio where
+  constructor MkSpokenAudio
+  ||| The audio's bytes in base64, in the format the request asked for.
+  ||| `writeBase64` from `OpenRouter.HTTP` saves it to a file.
+  base64     : String
+  ||| What was said.
+  transcript : String
+
 public export
 record Choice where
   constructor MkChoice
@@ -217,11 +227,25 @@ record Choice where
   ||| Set when the model declined to answer.
   refusal            : Maybe String
   logprobs           : List TokenLogprob
+  ||| Images the model made, each as a `data:image/png;base64,...` URI.
+  images             : List String
+  ||| What the model spoke, when the request asked for audio.
+  audio              : Maybe SpokenAudio
   ||| The choice as it arrived; `JNull` when it was assembled from a stream.
   raw                : JSON
 
 nonBlank : JSON -> Maybe String
 nonBlank j = asString j >>= \s => if s == "" then Nothing else Just s
+
+||| The URLs in a message's or a delta's `images` array.
+export
+imageURLs : JSON -> List String
+imageURLs = mapMaybe (\i => asString (path ["image_url", "url"] i)) . asList
+
+spokenAudio : JSON -> Maybe SpokenAudio
+spokenAudio JNull = Nothing
+spokenAudio a     = Just (MkSpokenAudio (fromMaybe "" (asString (get "data" a)))
+                                        (fromMaybe "" (asString (get "transcript" a))))
 
 export
 choiceFromJSON : JSON -> Choice
@@ -235,6 +259,8 @@ choiceFromJSON j =
         (nonBlank (get "reasoning" m))
         (nonBlank (get "refusal" m))
         (logprobsFromJSON (get "logprobs" j))
+        (imageURLs (get "images" m))
+        (spokenAudio (get "audio" m))
         j
 
 public export
@@ -295,6 +321,37 @@ finish r = firstChoice r >>= finishReason
 export
 reasoningText : ChatResponse -> String
 reasoningText r = fromMaybe "" (firstChoice r >>= reasoning)
+
+||| The images in the reply, each as a data URI.
+export
+replyImages : ChatResponse -> List String
+replyImages r = maybe [] images (firstChoice r)
+
+||| The audio of the reply, when the request asked for one.
+export
+replyAudio : ChatResponse -> Maybe SpokenAudio
+replyAudio r = firstChoice r >>= audio
+
+||| Split a data URI into its media type and its base64 payload:
+||| `"data:image/png;base64,iVBOR..."` gives `("image/png", "iVBOR...")`.
+||| `Nothing` for anything else, an `https:` URL included.
+export
+fromDataURI : String -> Maybe (String, String)
+fromDataURI s =
+  if not (isPrefixOf "data:" s) then Nothing
+  else case break (== ',') (unpack (substr 5 (length s) s)) of
+    (meta, ',' :: payload) =>
+      let m = pack meta
+       in if isSuffixOf ";base64" m
+             then Just (substr 0 (length m `minus` 7) m, pack payload)
+             else Nothing
+    _ => Nothing
+
+||| A data URI for base64 data of the given media type, for `Image`, `File`
+||| and `References`.
+export
+dataURI : (mediaType : String) -> (base64 : String) -> String
+dataURI m b = "data:" ++ m ++ ";base64," ++ b
 
 --------------------------------------------------------------------------------
 -- Text completion responses
@@ -368,3 +425,72 @@ embeddingResponseFromJSON j =
 
     row : Nat -> JSON -> (Nat, List Double)
     row i e = (fromMaybe i (asNat (get "index" e)), mapMaybe asDouble (asList (get "embedding" e)))
+
+--------------------------------------------------------------------------------
+-- Image responses
+--------------------------------------------------------------------------------
+
+public export
+record GeneratedImage where
+  constructor MkGeneratedImage
+  ||| The image's bytes in base64. `writeBase64` from `OpenRouter.HTTP`
+  ||| saves them to a file.
+  base64    : String
+  ||| As `"image/png"`, when the provider says.
+  mediaType : Maybe String
+
+public export
+record ImageResponse where
+  constructor MkImageResponse
+  images : List GeneratedImage
+  usage  : Maybe Usage
+  raw    : JSON
+
+export
+imageResponseFromJSON : JSON -> ImageResponse
+imageResponseFromJSON j = MkImageResponse
+  (mapMaybe one (asList (get "data" j)))
+  (usageFromJSON (get "usage" j))
+  j
+  where
+    one : JSON -> Maybe GeneratedImage
+    one i = (\b => MkGeneratedImage b (asString (get "media_type" i))) <$> asString (get "b64_json" i)
+
+--------------------------------------------------------------------------------
+-- Transcriptions
+--------------------------------------------------------------------------------
+
+||| A stretch of a transcript, with its times in seconds.
+public export
+record Segment where
+  constructor MkSegment
+  start : Double
+  end   : Double
+  text  : String
+
+public export
+record Transcription where
+  constructor MkTranscription
+  text     : String
+  ||| The language heard. With `Verbose True`.
+  language : Maybe String
+  ||| The length of the audio, in seconds. With `Verbose True`, or from usage.
+  duration : Maybe Double
+  ||| Timed segments. With `Verbose True`.
+  segments : List Segment
+  ||| What the request cost, in credits.
+  cost     : Maybe Double
+  raw      : JSON
+
+export
+transcriptionFromJSON : JSON -> Transcription
+transcriptionFromJSON j = MkTranscription
+  (fromMaybe "" (asString (get "text" j)))
+  (asString (get "language" j))
+  (asDouble (get "duration" j) <|> asDouble (path ["usage", "seconds"] j))
+  (mapMaybe segment (asList (get "segments" j)))
+  (asDouble (path ["usage", "cost"] j))
+  j
+  where
+    segment : JSON -> Maybe Segment
+    segment s = [| MkSegment (asDouble (get "start" s)) (asDouble (get "end" s)) (asString (get "text" s)) |]

@@ -58,6 +58,8 @@ record Model where
   supportedParameters : List String
   ||| Whether the top provider applies its own moderation.
   moderated           : Bool
+  ||| For a speech model: the voices it has.
+  voices              : List String
   raw                 : JSON
 
 export
@@ -74,6 +76,7 @@ modelFromJSON j = MkModel
   (asStrings (path ["architecture", "output_modalities"] j))
   (asStrings (get "supported_parameters" j))
   (fromMaybe False (asBool (path ["top_provider", "is_moderated"] j)))
+  (asStrings (get "supported_voices" j))
   j
 
 ||| Whether a model takes a request parameter, as `"tools"` or

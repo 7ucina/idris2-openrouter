@@ -48,6 +48,21 @@ prim__timedOut : AnyPtr -> PrimIO Int
 %foreign lib "or_response_header"
 prim__responseHeader : AnyPtr -> String -> PrimIO String
 
+%foreign lib "or_save"
+prim__save : AnyPtr -> String -> PrimIO Int
+
+%foreign lib "or_file_base64"
+prim__fileBase64 : String -> PrimIO String
+
+%foreign lib "or_file_ok"
+prim__fileOk : String -> PrimIO Int
+
+%foreign lib "or_base64_file"
+prim__base64File : String -> String -> PrimIO Int
+
+%foreign lib "or_pcm_to_wav"
+prim__pcmToWav : String -> String -> Int -> Int -> PrimIO Int
+
 %foreign lib "or_free"
 prim__free : AnyPtr -> PrimIO ()
 
@@ -164,6 +179,17 @@ export
 close : HasIO io => Response -> io ()
 close r = primIO (prim__free r.ptr)
 
+||| Write the rest of the body to a file, byte for byte: for a body that is
+||| not text, such as audio. The result is the number of bytes written.
+export
+save : HasIO io => Response -> (path : String) -> io (Either Failure Nat)
+save r path = do
+  n <- primIO (prim__save r.ptr path)
+  e <- primIO (prim__error r.ptr)
+  if e /= "" then Left <$> failure r.ptr
+    else if n < 0 then pure (Left (Unreachable ("could not write " ++ path)))
+    else pure (Right (cast n))
+
 ||| The rest of the body.
 export
 covering
@@ -187,3 +213,35 @@ fetch req = do
   b <- rest r
   close r
   pure (map (status r,) b)
+
+--------------------------------------------------------------------------------
+-- Binary files
+--------------------------------------------------------------------------------
+
+||| The contents of a file as base64, which is how images and audio travel
+||| inside JSON. `Nothing` when the file cannot be read.
+export
+readBase64 : HasIO io => (path : String) -> io (Maybe String)
+readBase64 path = do
+  ok <- primIO (prim__fileOk path)
+  if ok == 0 then pure Nothing else Just <$> primIO (prim__fileBase64 path)
+
+||| Decode base64 text into a file. The result is the number of bytes
+||| written, or `Nothing` when the text is not base64 or the file cannot be
+||| written. Pieces that were encoded one by one and then joined, as audio
+||| arrives from a stream, decode correctly.
+export
+writeBase64 : HasIO io => (path : String) -> (base64 : String) -> io (Maybe Nat)
+writeBase64 path text = do
+  n <- primIO (prim__base64File path text)
+  pure (if n < 0 then Nothing else Just (cast n))
+
+||| Copy headerless 16-bit PCM, which is what speech models produce by
+||| default, into a WAV file that players and transcription models accept.
+||| The result is the size of the WAV file, or `Nothing` on failure.
+export
+pcmToWav : HasIO io => (pcmPath : String) -> (wavPath : String) -> (sampleRate : Nat) -> (channels : Nat)
+        -> io (Maybe Nat)
+pcmToWav pcm wav rate channels = do
+  n <- primIO (prim__pcmToWav pcm wav (cast rate) (cast channels))
+  pure (if n < 0 then Nothing else Just (cast n))

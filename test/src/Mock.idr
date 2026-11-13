@@ -58,7 +58,7 @@ basics c = do
     #"{"model":"mock/echo","messages":[{"role":"system","content":"s"},{"role":"user","content":"u"}],"max_tokens":5,"provider":{"sort":"price"}}"#
   same "the headers the server received"
     (asString (get "referer" echoed), asString (get "agent" echoed), asString (get "extra" echoed))
-    (Just "https://example.com", Just "idris2-openrouter/0.1.0", Just "yes")
+    (Just "https://example.com", Just "idris2-openrouter/0.2.0", Just "yes")
 
   u <- chat c (chatRequest "mock/unknown" ["hi"] [])
   same "a bad request is an API error" (outcome u) "api 400 unknown mock model mock/unknown"
@@ -253,6 +253,57 @@ others c = do
   r <- call c GET "/models/count" [] Nothing
   same "call reaches any endpoint" (either (const "") render r) #"{"data":{"count":2}}"#
 
+media : Tally => Client -> IO ()
+media c = do
+  section "Mock: images and audio"
+  let out = "test/build/media.bin"
+  r <- generateImage c (imageRequest "mock/image" "a cat" [Count 2])
+  same "an image request returns images" (either (const []) (map mediaType . images) r) [Just "image/png", Just "image/png"]
+  n <- maybe (pure Nothing) (saveBase64 out . base64) (either (const Nothing) (head' . images) r)
+  back <- readBase64 out
+  same "an image is saved byte for byte" (n, back) (Just 16, Just "iVBORw0KGgoA//5hIGNhdA==")
+  r <- generateImage c (imageRequest "mock/no-image" "a cat" [])
+  same "an image request that is refused" (outcome r) "api 400 Model cannot make images"
+
+  r <- speech c (speechRequest "mock/voice" "Hello" [Voice "v", SpeechFormat "mp3"]) out
+  back <- readBase64 out
+  same "speech is saved byte for byte, though it is not text" (either (const 0) id r) (768 + length "v|mp3|Hello")
+  same "every byte value survives"
+    (map (\b => (substr 0 12 b, substr 1016 8 b, substr 1024 16 b)) back)
+    (Just ("AAECAwQFBgcI", "+vv8/f7/", "dnxtcDN8SGVsbG8="))
+  r <- speech c (speechRequest "mock/mute" "Hello" []) out
+  same "a speech request that is refused" (outcome r) "api 402 Insufficient credits"
+
+  Just audio <- audioFile out
+    | Nothing => check "a file is read as audio" False
+  r <- transcribe c (transcriptionRequest "mock/ears" audio [Language "en", Verbose True])
+  same "a transcription, with the audio sent whole"
+    (either (const Nothing) (\t => Just (t.text, t.language, t.duration, map text t.segments, t.cost)) r)
+    (Just ("heard 779 bytes of bin in en", Just "english", Just 1.5, ["heard"], Just 0.0002))
+  r <- transcribe c (transcriptionRequest "mock/ears" (AudioURL "https://x/a.mp3") [])
+  same "a transcription from a URL" (either (const "") text r) "heard 15 bytes of None in None"
+  missing <- audioFile "test/build/no-such-file.wav"
+  same "a file that is not there" (map (const ()) missing) Nothing
+
+  r <- chatStream c (chatRequest "mock/media" ["Say hello and draw."] (spoken "alloy" "wav")) (\_ => pure ())
+  same "a spoken reply: text, transcript and pictures"
+    (either (const Nothing) (\x => Just (text x, map transcript (replyAudio x), map fromDataURI (replyImages x))) r)
+    (Just ("Here. ", Just "Hello there", [Just ("image/png", "iVBORwBwaWM=")]))
+  n <- maybe (pure Nothing) (saveBase64 out . base64) (either (const Nothing) replyAudio r)
+  back <- readBase64 out
+  same "audio streamed in separately encoded pieces decodes as one" (n, back) (Just 12, Just "UklGRgD//mFsbG95")
+  r <- chat c (chatRequest "mock/media" ["Draw."] [Modalities ["image", "text"]])
+  same "pictures in a plain reply" (either (const []) replyImages r) ["data:image/png;base64,iVBORw0KGgo=", "https://example.com/cat.png"]
+  n <- maybe (pure Nothing) (saveDataURI out) (either (const Nothing) (head' . replyImages) r)
+  u <- fileDataURI "image/png" out
+  same "a data URI is saved, and a file becomes a data URI" (n, u) (Just 8, Just "data:image/png;base64,iVBORw0KGgo=")
+  _ <- saveBase64 out "AAEC/w=="
+  n <- saveWav out "test/build/media.wav" 24000
+  w <- readBase64 "test/build/media.wav"
+  same "PCM is wrapped in a WAV header" (n, w) (Just 48, Just "UklGRigAAABXQVZFZm10IBAAAAABAAEAwF0AAIC7AAACABAAZGF0YQQAAAAAAQL/")
+  n <- saveBase64 out "not base64!"
+  same "text that is not base64 is refused" n Nothing
+
 export
 mockTests : Tally => (url : String) -> IO ()
 mockTests url = do
@@ -263,3 +314,4 @@ mockTests url = do
   tools c
   structured c
   others c
+  media c

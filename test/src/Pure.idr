@@ -290,6 +290,51 @@ responseTests = do
   same "a key with no limit" (k.label, k.usage, k.limit, k.freeTier) ("sk-or-...", Just 2.5, Nothing, True)
   same "credits left" (remaining (creditsFromJSON (parsed #"{"total_credits":25,"total_usage":3.25}"#))) 21.75
 
+mediaTests : Tally => IO ()
+mediaTests = do
+  section "Images and audio"
+  same "an image request"
+    (render (toJSON (imageRequest "m" "a cat" [AspectRatio "16:9", Resolution "2K", Quality "high", ImageFormat "webp", Count 2, Background "transparent", Seed 7, References ["https://x/y.png"]])))
+    (#"{"model":"m","prompt":"a cat","aspect_ratio":"16:9","resolution":"2K","quality":"high","output_format":"webp","n":2,"background":"transparent","seed":7,"#
+      ++ #""input_references":[{"type":"image_url","image_url":{"url":"https://x/y.png"}}]}"#)
+  same "a speech request"
+    (render (toJSON (speechRequest "m" "Hello" [Voice "alloy", SpeechFormat "mp3", Speed 1.25, Instructions "Warmly."])))
+    #"{"model":"m","input":"Hello","voice":"alloy","response_format":"mp3","speed":1.25,"instructions":"Warmly."}"#
+  same "a transcription request, from data and from a URL"
+    (render (toJSON (transcriptionRequest "m" (AudioData "UklG" "wav") [Language "en", Keyterms ["Idris"], Verbose True]))
+       ++ render (toJSON (transcriptionRequest "m" (AudioURL "https://x/a.mp3") [])))
+    (#"{"model":"m","input_audio":{"data":"UklG","format":"wav"},"language":"en","keyterms":["Idris"],"response_format":"verbose_json"}"#
+      ++ #"{"model":"m","input_audio":{"url":"https://x/a.mp3"}}"#)
+  same "a chat request for a spoken reply"
+    (render (toJSON (chatRequest "m" [] (spoken "alloy" "wav"))))
+    #"{"model":"m","messages":[],"modalities":["text","audio"],"audio":{"voice":"alloy","format":"wav"}}"#
+
+  let i = imageResponseFromJSON (parsed #"{"created":1,"data":[{"b64_json":"iVBOR","media_type":"image/png"},{"b64_json":"AAAA"},{"url":"x"}],"usage":{"cost":0.04}}"#)
+  same "an image response" (map (\g => (g.base64, g.mediaType)) i.images, i.usage >>= cost)
+    ([("iVBOR", Just "image/png"), ("AAAA", Nothing)], Just 0.04)
+  let t = transcriptionFromJSON (parsed #"{"text":"Hi there.","language":"english","duration":1.5,"segments":[{"start":0,"end":1.5,"text":"Hi there."},{"start":2}],"usage":{"cost":0.0002,"seconds":1.5}}"#)
+  same "a verbose transcription" (t.text, t.language, t.duration, map (\g => (g.start, g.end, g.text)) t.segments, t.cost)
+    ("Hi there.", Just "english", Just 1.5, [(0.0, 1.5, "Hi there.")], Just 0.0002)
+  let t' = transcriptionFromJSON (parsed #"{"text":"Hi.","usage":{"seconds":2.5}}"#)
+  same "a plain transcription takes its duration from usage" (t'.text, t'.language, t'.duration, length t'.segments) ("Hi.", Nothing, Just 2.5, 0)
+
+  let r = chatResponseFromJSON (parsed #"{"choices":[{"message":{"content":"A cat.","images":[{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBOR"}}],"audio":{"id":"a1","data":"UklG","transcript":"A cat."}}}]}"#)
+  same "images in a chat reply" (replyImages r) ["data:image/png;base64,iVBOR"]
+  same "audio in a chat reply" (map (\a => (a.base64, a.transcript)) (replyAudio r)) (Just ("UklG", "A cat."))
+  same "a reply with neither" (replyImages (chatResponseFromJSON (parsed sample)), map transcript (replyAudio (chatResponseFromJSON (parsed sample)))) ([], Nothing)
+  same "a data URI splits into type and payload" (fromDataURI "data:image/png;base64,iVBOR") (Just ("image/png", "iVBOR"))
+  same "and is put back together" (dataURI "image/png" "iVBOR") "data:image/png;base64,iVBOR"
+  same "a URL is not a data URI" (fromDataURI "https://example.com/a.png") Nothing
+  same "a data URI that is not base64 is refused" (fromDataURI "data:text/plain,hello") Nothing
+
+  let s = collectChunks $ map (chunkFromJSON . parsed)
+        [ #"{"choices":[{"index":0,"delta":{"audio":{"data":"UklG","transcript":"Hel"}}}]}"#
+        , #"{"choices":[{"index":0,"delta":{"audio":{"transcript":"lo"}}}]}"#
+        , #"{"choices":[{"index":0,"delta":{"audio":{"data":"AAA="},"images":[{"image_url":{"url":"data:image/png;base64,AA"}}]}}]}"# ]
+  same "streamed audio and images are collected"
+    (map (\a => (a.base64, a.transcript)) (replyAudio s), replyImages s)
+    (Just ("UklGAAA=", "Hello"), ["data:image/png;base64,AA"])
+
 --------------------------------------------------------------------------------
 -- Server-sent events
 --------------------------------------------------------------------------------
@@ -379,5 +424,6 @@ pureTests = do
   schemaTests
   requestTests
   responseTests
+  mediaTests
   sseTests
   streamTests

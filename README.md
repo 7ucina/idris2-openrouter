@@ -4,7 +4,8 @@
 
 A client for the [OpenRouter](https://openrouter.ai) API in [Idris 2](https://www.idris-lang.org):
 chat, streaming, tool calls with typed arguments, structured output with typed results,
-text completions, embeddings, and the catalog and account endpoints.
+images and audio in both directions, text completions, embeddings, and the catalog and
+account endpoints.
 
 ```idris
 import OpenRouter
@@ -119,11 +120,67 @@ by the same schema. A reply that does not fit comes back as `Left (Mismatched ..
 the place and the reason. Not every model supports structured output: `models client
 [("supported_parameters", "structured_outputs")]` lists the ones that do.
 
+### Images
+
+Models built to make images have their own endpoint:
+
+```idris
+Right response <- generateImage client $
+    imageRequest "recraft/recraft-v4.1-flash-v2" "a small red fox, flat vector illustration"
+      [AspectRatio "16:9"]
+for_ response.images $ \image => saveBase64 "fox.webp" image.base64
+```
+
+Chat models that draw return pictures in the reply. Ask for the image modality, then read
+`replyImages`, which works for streamed replies too:
+
+```idris
+Right reply <- chat client $
+    chatRequest "google/gemini-2.5-flash-image" ["Draw a red circle."] [Modalities ["image", "text"]]
+for_ (replyImages reply) (saveDataURI "circle.png")
+```
+
+To send a picture, use an `Image` part with a URL, or with a local file through
+`fileDataURI "image/png" "photo.png"`.
+
+### Audio
+
+```idris
+-- text to speech, into a file
+Right _ <- speech client
+    (speechRequest "heygen/heygen-voice-1-turbo:free" "Hello." [Voice "nadine"]) "hello.pcm"
+Just _  <- saveWav "hello.pcm" "hello.wav" 24000
+
+-- speech to text
+Just audio <- audioFile "hello.wav"
+Right heard <- transcribe client (transcriptionRequest "openai/gpt-4o-mini-transcribe" audio [])
+putStrLn heard.text
+```
+
+Speech arrives as raw bytes and goes straight to the file. Most speech models only
+produce headerless 16-bit PCM (the default), so `saveWav` adds the WAV header that
+players and transcription models want. A model's voices are in its catalog entry
+(`models client [("output_modalities", "speech")]`, then `.voices`).
+
+A chat model with audio output can speak its reply. Audio only arrives on a stream, so
+use `chatStream` with the `spoken` options, then read `replyAudio`:
+
+```idris
+Right reply <- chatStream client
+    (chatRequest "openai/gpt-audio-mini" ["Say hello."] (spoken "alloy" "pcm16")) (\_ => pure ())
+for_ (replyAudio reply) $ \audio => do
+  putStrLn audio.transcript
+  saveBase64 "reply.pcm" audio.base64
+```
+
+To send audio to a chat model, use an `Audio` part: `Audio base64 "wav"`.
+
 ### Everything else
 
 | Function | What it does |
 | --- | --- |
 | `ask` | One prompt in, the reply's text out. |
+| `generateImage`, `speech`, `transcribe` | Images, text to speech and speech to text, as above. |
 | `complete`, `completeStream` | Text completions (`/completions`). |
 | `embed` | Embeddings: one vector per input, in input order. |
 | `models`, `modelCount`, `embeddingModels` | The catalog, with prices, context lengths and supported parameters. No key needed. |
@@ -180,7 +237,7 @@ data Error
 | --- | --- |
 | `OpenRouter` | Re-exports everything below except `HTTP` and `SSE`. |
 | `OpenRouter.Client` | `Client` and every function that talks to the API. |
-| `OpenRouter.Request` | `ChatRequest`, `Option`, tools, response formats, provider routing. |
+| `OpenRouter.Request` | `ChatRequest`, `Option`, tools, response formats, provider routing, and the image, speech and transcription requests. |
 | `OpenRouter.Message` | Messages, content parts, tool calls. |
 | `OpenRouter.Response` | `ChatResponse`, `Usage`, log probabilities, `Error`. |
 | `OpenRouter.Stream` | `Chunk`, and the accumulator that folds chunks into a `ChatResponse`. |
@@ -189,15 +246,16 @@ data Error
 | `OpenRouter.Model` | Models, endpoints, providers, key, credits, generations. |
 | `OpenRouter.JSON` | A JSON value type, parser and printers. |
 | `OpenRouter.SSE` | An incremental server-sent event decoder. |
-| `OpenRouter.HTTP` | The libcurl binding. |
+| `OpenRouter.HTTP` | The libcurl binding, and base64 and WAV file helpers. |
 
 `idris2 --mkdoc openrouter.ipkg` builds the API reference from the doc comments.
 
 ## Examples
 
-`examples/` has six programs: `Hello`, `Stream`, `Tools`, `Structured`, `Chat` (a terminal
-chat that keeps the conversation) and `Models` (the cheapest models that can call tools;
-needs no key).
+`examples/` has eight programs: `Hello`, `Stream`, `Tools`, `Structured`, `Chat` (a
+terminal chat that keeps the conversation), `Image` (makes a picture and saves it),
+`Speech` (reads a sentence aloud, then transcribes the recording) and `Models` (the
+cheapest models that can call tools; needs no key).
 
 ```sh
 export OPENROUTER_API_KEY=sk-or-...
@@ -223,23 +281,31 @@ response decoding, and the event-stream decoder (including a stream cut in two a
 possible position). The mock tests cover every client function against a local server
 that misbehaves on purpose: rate limits with `Retry-After`, provider errors hidden in a
 200, repeated 503s, bodies that are not JSON, timeouts, streams cut mid-line and
-mid-character, a stream that fails midway, one that goes silent, and one that is refused.
+mid-character, a stream that fails midway, one that goes silent, one that is refused, and
+audio whose bytes are not text.
 Neither needs a key.
 
 ## Status and limits
 
-- **Tested against openrouter.ai** with `openai/gpt-4o-mini`, `openai/gpt-5-nano` and
-  `openai/text-embedding-3-small`: chat, streaming, a tool loop, a streamed tool call,
-  structured output, log probabilities, reasoning, text completions, embeddings, and the
-  key, credits and generation endpoints. Other models and providers are covered only by
-  the mock, which follows OpenRouter's documented shapes. `test/run.sh --live` repeats
-  these requests when `OPENROUTER_API_KEY` is set; together they cost well under a cent.
+- **Tested against openrouter.ai** with a handful of models (`openai/gpt-4o-mini`,
+  `openai/gpt-5-nano`, `openai/gpt-audio-mini`, `google/gemini-2.5-flash-image`, and one
+  model each for embeddings, images, speech and transcription): chat, streaming, a tool
+  loop, a streamed tool call, structured output, log probabilities, reasoning, text
+  completions, embeddings, image generation, pictures in chat replies, image and audio
+  input, speech, a spoken chat reply, transcription, and the key, credits and generation
+  endpoints. Other models and providers are covered only by the mock, which follows
+  OpenRouter's documented shapes. `test/run.sh --live` repeats nearly all of this when
+  `OPENROUTER_API_KEY` is set, for about a cent.
+- **Audio formats depend on the provider.** Several speech models refuse
+  `SpeechFormat "mp3"`, and OpenAI's audio chat models only stream `"pcm16"`. Free models
+  need your account's privacy settings to allow them.
 - **Tested with Idris 0.8.0 and the Chez backend**, on macOS (arm64) and, in CI, on Linux
   (x86-64).
 - **Requests block.** There is no async interface; a request occupies its thread until
   it returns, and a stream must be closed (`chatStream` and `chatStreamText` close theirs).
-- Not covered: the Responses and Anthropic Messages endpoints, image and audio output
-  (reachable through `raw`), API key management, and OAuth.
+- Not covered: the Responses and Anthropic Messages endpoints, video generation,
+  streamed partial images from the image endpoint, multipart uploads, API key management,
+  and OAuth. `call` reaches any JSON endpoint.
 
 ## License
 

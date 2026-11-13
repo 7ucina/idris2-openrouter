@@ -224,6 +224,39 @@ data Option : Type where
   Modalities          : List String -> Option
   ||| A stable id for your end user, which helps OpenRouter detect abuse.
   EndUser             : String -> Option
+  ||| Chat: speak the reply, in this voice (`"alloy"`) and format (`"wav"`,
+  ||| `"mp3"`, `"pcm16"`). Needs `Modalities ["text", "audio"]`, a model with
+  ||| audio output, and a streamed request. See `spoken`.
+  AudioOutput         : (voice : String) -> (format : String) -> Option
+  ||| Speech: the voice, by its provider-specific name. A model's voices
+  ||| are in its catalog entry.
+  Voice               : String -> Option
+  ||| Speech: `"mp3"` or `"pcm"` (the default; 16-bit little-endian).
+  SpeechFormat        : String -> Option
+  ||| Speech: a speed multiplier, for models that have one.
+  Speed               : Double -> Option
+  ||| Speech: how to say it, as `"Speak in a warm and friendly tone."`
+  Instructions        : String -> Option
+  ||| Transcription: the language spoken, as `"en"`. Detected when left out.
+  Language            : String -> Option
+  ||| Transcription: names and terms to listen for.
+  Keyterms            : List String -> Option
+  ||| Transcription: also return the language, the duration and timed segments.
+  Verbose             : Bool -> Option
+  ||| Images: the shape, as `"16:9"`.
+  AspectRatio         : String -> Option
+  ||| Images: the resolution tier: `"1K"`, `"2K"`, `"4K"`.
+  Resolution          : String -> Option
+  ||| Images: `"low"`, `"medium"`, `"high"` or `"auto"`.
+  Quality             : String -> Option
+  ||| Images: `"png"`, `"jpeg"`, `"webp"`, `"svg"` or `"gif"`.
+  ImageFormat         : String -> Option
+  ||| Images: how many to make, at most.
+  Count               : Nat -> Option
+  ||| Images: `"transparent"`, `"opaque"` or `"auto"`.
+  Background          : String -> Option
+  ||| Images: pictures to work from, as URLs or data URIs.
+  References          : List String -> Option
   ||| Any other parameter, by its JSON name.
   Field               : String -> JSON -> Option
 
@@ -236,6 +269,13 @@ plugin i settings = JObject (("id", JString i) :: settings)
 export
 webSearch : JSON
 webSearch = plugin "web" []
+
+||| The options that make a chat model speak its reply: the audio modality,
+||| a voice and a format. Send the request with `chatStream`: audio only
+||| arrives on a stream.
+export
+spoken : (voice : String) -> (format : String) -> List Option
+spoken voice format = [Modalities ["text", "audio"], AudioOutput voice format]
 
 optionField : Option -> (String, JSON)
 optionField (Temperature x)         = ("temperature", JNum x)
@@ -264,6 +304,22 @@ optionField (Plugins ps)            = ("plugins", JArray ps)
 optionField (Transforms ts)         = ("transforms", toJSON ts)
 optionField (Modalities ms)         = ("modalities", toJSON ms)
 optionField (EndUser u)             = ("user", JString u)
+optionField (AudioOutput v f)       = ("audio", JObject [("voice", JString v), ("format", JString f)])
+optionField (Voice v)               = ("voice", JString v)
+optionField (SpeechFormat f)        = ("response_format", JString f)
+optionField (Speed x)               = ("speed", JNum x)
+optionField (Instructions i)        = ("instructions", JString i)
+optionField (Language l)            = ("language", JString l)
+optionField (Keyterms ks)           = ("keyterms", toJSON ks)
+optionField (Verbose b)             = ("response_format", JString (if b then "verbose_json" else "json"))
+optionField (AspectRatio a)         = ("aspect_ratio", JString a)
+optionField (Resolution r)          = ("resolution", JString r)
+optionField (Quality q)             = ("quality", JString q)
+optionField (ImageFormat f)         = ("output_format", JString f)
+optionField (Count n)               = ("n", toJSON n)
+optionField (Background b)          = ("background", JString b)
+optionField (References us)         =
+  ("input_references", JArray (map (\u => JObject [("type", JString "image_url"), ("image_url", JObject [("url", JString u)])]) us))
 optionField (Field k v)             = (k, v)
 
 ||| The JSON fields of some options. A later option replaces an earlier one
@@ -360,3 +416,84 @@ export
 ToJSON EmbeddingRequest where
   toJSON r = JObject $ lastWins $
     [("model", JString r.model), ("input", toJSON r.input)] ++ optionFields r.options
+
+--------------------------------------------------------------------------------
+-- Image requests
+--------------------------------------------------------------------------------
+
+||| A request to make images from a prompt, for the image endpoint. Useful
+||| options: `AspectRatio`, `Resolution`, `Quality`, `ImageFormat`, `Count`,
+||| `Background`, `References`, `Seed`, `Provider`.
+public export
+record ImageRequest where
+  constructor MkImageRequest
+  model   : String
+  prompt  : String
+  options : List Option
+
+public export
+imageRequest : (model : String) -> (prompt : String) -> List Option -> ImageRequest
+imageRequest = MkImageRequest
+
+export
+ToJSON ImageRequest where
+  toJSON r = JObject $ lastWins $
+    [("model", JString r.model), ("prompt", JString r.prompt)] ++ optionFields r.options
+
+--------------------------------------------------------------------------------
+-- Speech requests
+--------------------------------------------------------------------------------
+
+||| A request to read a text aloud. Useful options: `Voice`, `SpeechFormat`,
+||| `Speed`, `Instructions`, `Provider`.
+public export
+record SpeechRequest where
+  constructor MkSpeechRequest
+  model   : String
+  input   : String
+  options : List Option
+
+public export
+speechRequest : (model : String) -> (input : String) -> List Option -> SpeechRequest
+speechRequest = MkSpeechRequest
+
+export
+ToJSON SpeechRequest where
+  toJSON r = JObject $ lastWins $
+    [("model", JString r.model), ("input", JString r.input)] ++ optionFields r.options
+
+--------------------------------------------------------------------------------
+-- Transcription requests
+--------------------------------------------------------------------------------
+
+||| Audio to transcribe.
+public export
+data AudioSource : Type where
+  ||| The audio's bytes in base64 (not a data URI), and their format:
+  ||| `"wav"`, `"mp3"`, `"flac"`, `"m4a"`, `"ogg"`, `"webm"`.
+  AudioData : (base64 : String) -> (format : String) -> AudioSource
+  ||| A public URL the provider downloads. Only some providers can.
+  AudioURL  : (url : String) -> AudioSource
+
+export
+ToJSON AudioSource where
+  toJSON (AudioData d f) = JObject [("data", JString d), ("format", JString f)]
+  toJSON (AudioURL u)    = JObject [("url", JString u)]
+
+||| A request to turn speech into text. Useful options: `Language`,
+||| `Keyterms`, `Verbose`, `Temperature`, `Provider`.
+public export
+record TranscriptionRequest where
+  constructor MkTranscriptionRequest
+  model   : String
+  audio   : AudioSource
+  options : List Option
+
+public export
+transcriptionRequest : (model : String) -> AudioSource -> List Option -> TranscriptionRequest
+transcriptionRequest = MkTranscriptionRequest
+
+export
+ToJSON TranscriptionRequest where
+  toJSON r = JObject $ lastWins $
+    [("model", JString r.model), ("input_audio", toJSON r.audio)] ++ optionFields r.options
