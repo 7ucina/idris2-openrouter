@@ -1,0 +1,7 @@
+# Lets the tests and the examples in this repository depend on the package
+# in this directory.
+[custom.all.openrouter]
+type = "local"
+path = "."
+ipkg = "openrouter.ipkg"
+test = "test/test.ipkg"

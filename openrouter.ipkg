@@ -1,0 +1,27 @@
+package openrouter
+version    = 0.1.0
+brief      = "A client for the OpenRouter API: chat, streaming, typed tools and structured output"
+authors    = "Belphegor"
+license    = "MIT"
+sourceloc  = "https://github.com/7ucina/idris2-openrouter"
+readme     = "README.md"
+langversion >= 0.7.0
+
+sourcedir  = "src"
+depends    = base >= 0.7.0
+
+modules    = OpenRouter
+           , OpenRouter.Client
+           , OpenRouter.HTTP
+           , OpenRouter.JSON
+           , OpenRouter.Message
+           , OpenRouter.Model
+           , OpenRouter.Request
+           , OpenRouter.Response
+           , OpenRouter.SSE
+           , OpenRouter.Schema
+           , OpenRouter.Stream
+           , OpenRouter.Tools
+
+-- Builds support/openrouter_curl.c into lib/, which is installed with the package.
+prebuild   = "make -C support"

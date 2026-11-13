@@ -1,0 +1,7 @@
+package openrouter-examples
+version = 0.1.0
+brief   = "Example programs for the openrouter package"
+depends = base, openrouter
+
+-- Each file is a program of its own. Run one with:
+--   pack exec examples/Hello.idr

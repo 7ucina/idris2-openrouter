@@ -1,0 +1,7 @@
+build/
+lib/
+support/*.dylib
+support/*.so
+support/*.dll
+_tmppack*
+.DS_Store

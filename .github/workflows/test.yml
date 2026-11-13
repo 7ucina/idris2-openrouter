@@ -1,0 +1,18 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container: ghcr.io/stefan-hoeck/idris2-pack:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install libcurl, make and Python
+        run: apt-get update && apt-get install -y --no-install-recommends gcc make curl python3 libcurl4-openssl-dev
+      # The pure tests, then the client against test/mock.py. Needs no API key.
+      - name: Test
+        run: test/run.sh

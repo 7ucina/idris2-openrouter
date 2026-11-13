@@ -1,0 +1,7 @@
+package openrouter-test
+version    = 0.1.0
+sourcedir  = "src"
+depends    = base, openrouter
+main       = Main
+executable = "openrouter-test"
+modules    = Harness, Pure, Mock, Live, Main
