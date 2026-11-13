@@ -128,7 +128,7 @@ httpRequest c stream method path query body = MkRequest
   , headers  = (if c.apiKey == "" then [] else [("Authorization", "Bearer " ++ c.apiKey)])
             ++ (if isJust body then [("Content-Type", "application/json")] else [])
             ++ [("Accept", if stream then "text/event-stream" else "application/json")]
-            ++ [("User-Agent", "idris2-openrouter/0.2.0")]
+            ++ [("User-Agent", "idris2-openrouter/0.3.0")]
             ++ maybe [] (\u => [("HTTP-Referer", u)]) c.appUrl
             ++ maybe [] (\t => [("X-Title", t)]) c.appTitle
             ++ c.headers

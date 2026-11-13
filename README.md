@@ -4,8 +4,8 @@
 
 A client for the [OpenRouter](https://openrouter.ai) API in [Idris 2](https://www.idris-lang.org):
 chat, streaming, tool calls with typed arguments, structured output with typed results,
-images and audio in both directions, text completions, embeddings, and the catalog and
-account endpoints.
+images and audio in both directions, requests run concurrently, text completions,
+embeddings, and the catalog and account endpoints.
 
 ```idris
 import OpenRouter
@@ -175,6 +175,29 @@ for_ (replyAudio reply) $ \audio => do
 
 To send audio to a chat model, use an `Audio` part: `Audio base64 "wav"`.
 
+### Many requests at once
+
+Every client function blocks until it is done. To run several at the same time, put each
+on a thread of its own:
+
+```idris
+-- a batch, three at a time, replies in the order of the requests
+replies <- chatAll client 3 requests
+
+-- any actions at all, at most eight at a time
+answers <- concurrently 8 [ask client model q | q <- questions]
+
+-- one task in the background
+task  <- async (chat client bigRequest)
+...                                   -- carry on with other work
+reply <- await task                   -- or `poll task` to look without waiting
+```
+
+One request failing does not disturb the others: each result is its own `Either Error`.
+Streams can run side by side the same way. These are operating system threads, and a
+thread waiting on the network does not hold up the rest of the program. A task cannot be
+cancelled from outside; give requests a `requestTimeout` instead.
+
 ### Everything else
 
 | Function | What it does |
@@ -230,7 +253,8 @@ data Error
   `MaxTokens 256` goes out as `256`, not `256.0`.
 - **HTTP is libcurl**, through a small C shim that Idris pulls the response body from
   piece by piece. No C callback re-enters Idris, pieces never end in the middle of a
-  UTF-8 character, and you get libcurl's TLS, HTTP/2, proxy support (`HTTPS_PROXY`) and
+  UTF-8 character, a thread waiting on the network does not block the garbage collector
+  for other threads, and you get libcurl's TLS, HTTP/2, proxy support (`HTTPS_PROXY`) and
   system certificates.
 
 | Module | Contents |
@@ -243,6 +267,7 @@ data Error
 | `OpenRouter.Stream` | `Chunk`, and the accumulator that folds chunks into a `ChatResponse`. |
 | `OpenRouter.Schema` | Typed JSON Schemas. |
 | `OpenRouter.Tools` | `Handler` and `runTools`. |
+| `OpenRouter.Async` | `async`, `await`, `concurrently`, `chatAll`. |
 | `OpenRouter.Model` | Models, endpoints, providers, key, credits, generations. |
 | `OpenRouter.JSON` | A JSON value type, parser and printers. |
 | `OpenRouter.SSE` | An incremental server-sent event decoder. |
@@ -252,10 +277,11 @@ data Error
 
 ## Examples
 
-`examples/` has eight programs: `Hello`, `Stream`, `Tools`, `Structured`, `Chat` (a
-terminal chat that keeps the conversation), `Image` (makes a picture and saves it),
-`Speech` (reads a sentence aloud, then transcribes the recording) and `Models` (the
-cheapest models that can call tools; needs no key).
+`examples/` has nine programs: `Hello`, `Stream`, `Tools`, `Structured`, `Chat` (a
+terminal chat that keeps the conversation), `Parallel` (several questions at once),
+`Image` (makes a picture and saves it), `Speech` (reads a sentence aloud, then
+transcribes the recording) and `Models` (the cheapest models that can call tools; needs
+no key).
 
 ```sh
 export OPENROUTER_API_KEY=sk-or-...
@@ -282,7 +308,8 @@ possible position). The mock tests cover every client function against a local s
 that misbehaves on purpose: rate limits with `Retry-After`, provider errors hidden in a
 200, repeated 503s, bodies that are not JSON, timeouts, streams cut mid-line and
 mid-character, a stream that fails midway, one that goes silent, one that is refused, and
-audio whose bytes are not text.
+audio whose bytes are not text. They also run requests and streams on several threads at
+once and check the timing and the server's count of requests in flight.
 Neither needs a key.
 
 ## Status and limits
@@ -292,8 +319,8 @@ Neither needs a key.
   model each for embeddings, images, speech and transcription): chat, streaming, a tool
   loop, a streamed tool call, structured output, log probabilities, reasoning, text
   completions, embeddings, image generation, pictures in chat replies, image and audio
-  input, speech, a spoken chat reply, transcription, and the key, credits and generation
-  endpoints. Other models and providers are covered only by the mock, which follows
+  input, speech, a spoken chat reply, transcription, concurrent requests, and the key,
+  credits and generation endpoints. Other models and providers are covered only by the mock, which follows
   OpenRouter's documented shapes. `test/run.sh --live` repeats nearly all of this when
   `OPENROUTER_API_KEY` is set, for about a cent.
 - **Audio formats depend on the provider.** Several speech models refuse
@@ -301,8 +328,10 @@ Neither needs a key.
   need your account's privacy settings to allow them.
 - **Tested with Idris 0.8.0 and the Chez backend**, on macOS (arm64) and, in CI, on Linux
   (x86-64).
-- **Requests block.** There is no async interface; a request occupies its thread until
-  it returns, and a stream must be closed (`chatStream` and `chatStreamText` close theirs).
+- **Concurrency is threads.** A request occupies its thread until it returns, and
+  `OpenRouter.Async` runs requests on threads of their own; there is no event loop and no
+  cancellation. It needs a threaded Chez, which is what Idris is normally built with. A
+  stream must be closed (`chatStream` and `chatStreamText` close theirs).
 - Not covered: the Responses and Anthropic Messages endpoints, video generation,
   streamed partial images from the image endpoint, multipart uploads, API key management,
   and OAuth. `call` reaches any JSON endpoint.

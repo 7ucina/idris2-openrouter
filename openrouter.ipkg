@@ -1,5 +1,5 @@
 package openrouter
-version    = 0.2.0
+version    = 0.3.0
 brief      = "A client for the OpenRouter API: chat, streaming, typed tools and structured output"
 authors    = "Belphegor"
 license    = "MIT"
@@ -11,6 +11,7 @@ sourcedir  = "src"
 depends    = base >= 0.7.0
 
 modules    = OpenRouter
+           , OpenRouter.Async
            , OpenRouter.Client
            , OpenRouter.HTTP
            , OpenRouter.JSON

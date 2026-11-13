@@ -58,7 +58,7 @@ basics c = do
     #"{"model":"mock/echo","messages":[{"role":"system","content":"s"},{"role":"user","content":"u"}],"max_tokens":5,"provider":{"sort":"price"}}"#
   same "the headers the server received"
     (asString (get "referer" echoed), asString (get "agent" echoed), asString (get "extra" echoed))
-    (Just "https://example.com", Just "idris2-openrouter/0.2.0", Just "yes")
+    (Just "https://example.com", Just "idris2-openrouter/0.3.0", Just "yes")
 
   u <- chat c (chatRequest "mock/unknown" ["hi"] [])
   same "a bad request is an API error" (outcome u) "api 400 unknown mock model mock/unknown"
@@ -304,6 +304,63 @@ media c = do
   n <- saveBase64 out "not base64!"
   same "text that is not base64 is refused" n Nothing
 
+together : Tally => Client -> IO ()
+together c = do
+  section "Mock: requests at the same time"
+  let wait : String -> ChatRequest
+      wait n = chatRequest "mock/wait" [user n] []
+      peak : IO (Maybe Integer)
+      peak = seen c "_peak"
+      reset : IO ()
+      reset = ignore (call c GET "/../../_reset" [] Nothing)
+
+  reset
+  t0 <- millis
+  rs <- chatAll c 0 (map wait ["a", "b", "c", "d", "e", "f"])
+  t1 <- millis
+  p <- peak
+  same "replies come back in the requests' order" (map replyText rs)
+    (map ("waited for " ++) ["a", "b", "c", "d", "e", "f"])
+  check ("six one-second requests take about a second, not six (" ++ show (t1 - t0) ++ " ms)") (t1 - t0 < 3000)
+  same "all six were in flight together" p (Just 6)
+
+  reset
+  t0 <- millis
+  rs <- chatAll c 2 (map wait ["a", "b", "c", "d"])
+  t1 <- millis
+  p <- peak
+  same "with a limit of two, two at a time" (p, map replyText rs) (Just 2, map ("waited for " ++) ["a", "b", "c", "d"])
+  check ("so four take about two seconds (" ++ show (t1 - t0) ++ " ms)") (t1 - t0 >= 1900 && t1 - t0 < 4000)
+
+  rs <- chatAll c 0 [wait "ok", chatRequest "mock/402" ["x"] [], chatRequest "mock/garbage" ["x"] []]
+  same "one failure does not disturb the others" (map outcome rs) ["ok", "api 402 Insufficient credits", "malformed"]
+  rs <- concurrently 3 (the (List (IO Nat)) [])
+  same "nothing to run" rs []
+
+  t0 <- millis
+  slow <- async (chat c (wait "task"))
+  early <- poll slow
+  quick <- ask c "mock/plain" "meanwhile"
+  t1 <- millis
+  r <- await slow
+  again <- await slow
+  late <- poll slow
+  same "a task runs while the caller carries on"
+    (map replyText early, either (const "") id quick, t1 - t0 < 900)
+    (Nothing, "You said: meanwhile | title=None | temp=None", True)
+  same "await gives its result, as often as asked" (replyText r, replyText again, map replyText late)
+    ("waited for task", "waited for task", Just "waited for task")
+
+  texts <- concurrently 0 $ map (\n => do
+             out <- newIORef ""
+             r <- chatStreamText c (chatRequest "mock/stream" [user n] []) (\t => modifyIORef out (++ t))
+             o <- readIORef out
+             pure (o, replyText r)) ["1", "2", "3", "4", "5", "6", "7", "8"]
+  same "eight streams at once keep their text apart" texts (replicate 8 ("Streamed héllo 😀 done", "Streamed héllo 😀 done"))
+
+  big <- concurrently 8 (replicate 40 (models c []))
+  same "forty requests through eight threads" (map (either (const 0) length) big) (replicate 40 2)
+
 export
 mockTests : Tally => (url : String) -> IO ()
 mockTests url = do
@@ -315,3 +372,4 @@ mockTests url = do
   structured c
   others c
   media c
+  together c

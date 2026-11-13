@@ -1,5 +1,10 @@
 // A pull-based HTTP client over libcurl, for the Idris 2 OpenRouter bindings.
 //
+// A request belongs to one thread at a time; different requests may run on
+// different threads at once. The calls that wait on the network (or_start,
+// or_wait, or_save_run) take no strings and are bound from Idris as collect-safe, so a thread
+// waiting in one does not hold up the garbage collector for the others.
+//
 // Idris asks for the next piece of the response body with or_next, so no C
 // callback ever re-enters Idris, and a streamed response can be read as it
 // arrives. Strings handed to Idris are owned by the request and stay valid
@@ -8,6 +13,7 @@
 // decoded in halves.
 
 #include <curl/curl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +30,7 @@ typedef struct or_req {
   CURLM             *multi;
   struct curl_slist *headers;
   char              *body;     // request body, kept alive for the transfer
+  FILE              *file;     // where or_save_run writes
   buf                in;       // response bytes received, not yet handed out
   buf                out;      // the piece last handed out
   buf                rh;       // response headers, "name: value\n" each
@@ -78,12 +85,11 @@ static size_t on_header(char *ptr, size_t size, size_t n, void *ud) {
   return buf_add(&r->rh, ptr, end) && buf_add(&r->rh, "\n", 1) ? len : 0;
 }
 
+static void global_init(void) { curl_global_init(CURL_GLOBAL_DEFAULT); }
+
 or_req *or_new(const char *method, const char *url) {
-  static int ready = 0;
-  if (!ready) {
-    curl_global_init(CURL_GLOBAL_DEFAULT);
-    ready = 1;
-  }
+  static pthread_once_t once = PTHREAD_ONCE_INIT;
+  pthread_once(&once, global_init);  // requests may start on several threads at once
   or_req *r = calloc(1, sizeof *r);
   if (!r) return NULL;
   r->easy = curl_easy_init();
@@ -203,6 +209,18 @@ static size_t partial_tail(const char *p, size_t n) {
   return 0;
 }
 
+// Wait until or_next can answer without waiting: a piece that ends on a
+// character boundary has arrived, or the response is over.
+void or_wait(or_req *r) {
+  size_t have = 0;
+  for (;;) {
+    pump(r, have);
+    if (r->done) return;
+    if (r->in.len > partial_tail(r->in.p, r->in.len)) return;
+    have = r->in.len;  // only part of a character so far
+  }
+}
+
 // The next piece of the body. "" once the response is over (see or_done).
 const char *or_next(or_req *r) {
   r->out.len = 0;
@@ -261,25 +279,34 @@ const char *or_response_header(or_req *r, const char *name) {
   return r->hv.p ? r->hv.p : "";
 }
 
-// Write the rest of the body to a file, bytes untouched: for responses that
-// are not text. The number of bytes written, or -1 when the file could not
-// be written (the transfer's own failure is reported by or_error).
-long or_save(or_req *r, const char *path) {
-  FILE *f = fopen(path, "wb");
-  if (!f) return -1;
+// Writing the rest of the body to a file, bytes untouched, for responses
+// that are not text. In two steps, so that the step that waits on the
+// network takes no string: or_save_to names the file (0 when it cannot be
+// opened), or_save_run fills it and returns the number of bytes written, or
+// -1 when the file could not be written. The transfer's own failure is
+// reported by or_error.
+int or_save_to(or_req *r, const char *path) {
+  if (r->file) fclose(r->file);
+  r->file = fopen(path, "wb");
+  return r->file != NULL;
+}
+
+long or_save_run(or_req *r) {
+  if (!r->file) return -1;
   long total = 0;
   int  bad = 0;
   for (;;) {
     pump(r, 0);
     if (r->in.len) {
-      if (fwrite(r->in.p, 1, r->in.len, f) != r->in.len) bad = 1;
+      if (fwrite(r->in.p, 1, r->in.len, r->file) != r->in.len) bad = 1;
       total += (long)r->in.len;
       r->in.len = 0;
       r->in.p[0] = 0;
     }
     if (r->done) break;
   }
-  if (fclose(f) != 0) bad = 1;
+  if (fclose(r->file) != 0) bad = 1;
+  r->file = NULL;
   return bad ? -1 : total;
 }
 
@@ -289,6 +316,7 @@ void or_free(or_req *r) {
   curl_easy_cleanup(r->easy);
   curl_multi_cleanup(r->multi);
   curl_slist_free_all(r->headers);
+  if (r->file) fclose(r->file);
   free(r->body);
   free(r->in.p);
   free(r->out.p);
@@ -300,7 +328,7 @@ void or_free(or_req *r) {
 // ---- Base64 files: how binary data (images, audio) crosses into JSON.
 
 static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-static buf        b64_out;  // the encoding last handed out
+static _Thread_local buf b64_out;  // the encoding last handed out, per thread
 
 // The contents of a file, base64-encoded. NULL-safe for Idris: "" when the
 // file could not be read (see or_file_ok). The string is valid until the

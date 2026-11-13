@@ -110,6 +110,10 @@ liveTests = do
          _         => False
        Left _ => False)
 
+  rs <- chatAll c 3 (map (\n => chatRequest mini [user ("Reply with only the number " ++ n ++ ".")] [MaxTokens 5, Temperature 0]) ["11", "22", "33", "44", "55"])
+  check ("five requests at once, answered in order: " ++ show (map (either show text) rs))
+    (map (either (const "") (pack . filter isDigit . unpack . text)) rs == ["11", "22", "33", "44", "55"])
+
   let out = "test/build/live"
   r <- speech c (speechRequest "heygen/heygen-voice-1-turbo:free" "The quick brown fox jumps over the lazy dog." [Voice "nadine"]) (out ++ ".pcm")
   check ("speech is written to a file: " ++ either show show r) (either (const False) (> 20000) r)

@@ -53,6 +53,9 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         p = self.path
         if p == "/_seen": return self.send_json(200, seen)   # how many requests each stateful model got
+        if p == "/_reset":
+            with lock: seen.clear()
+            return self.send_json(200, {})
         if not self.authed() and not p.startswith("/api/v1/models"):
             return self.send_json(401, err(401, "No auth credentials found"))
         if p == "/api/v1/models/count": return self.send_json(200, {"data": {"count": 2}})
@@ -148,6 +151,11 @@ class H(BaseHTTPRequestHandler):
             return self.send_json(200, reply(m, "```json\n{\"city\": \"Oslo\", \"celsius\": -3.5, \"advice\": null, \"tags\": [\"cold\", \"%s\"]}\n```" % fmt.get("json_schema", {}).get("name")))
         if m == "mock/structured-bad":
             return self.send_json(200, reply(m, "{\"city\": \"Oslo\", \"celsius\": \"cold\"}"))
+        if m == "mock/wait":       # a second's work; reports how many were in flight with it
+            with lock: seen["_now"] = seen.get("_now", 0) + 1; seen["_peak"] = max(seen.get("_peak", 0), seen["_now"])
+            time.sleep(1)
+            with lock: seen["_now"] -= 1
+            return self.send_json(200, reply(m, "waited for " + str(said)))
         if m == "mock/slow":
             time.sleep(3); return self.send_json(200, reply(m, "late"))
         if m == "mock/stream-stall" and stream:

@@ -15,6 +15,13 @@ import Data.String
 lib : String -> String
 lib f = "C:" ++ f ++ ",libidris2_openrouter"
 
+-- For the calls that wait on the network. A thread inside one is set aside
+-- from garbage collection, so the program's other threads keep running
+-- while it waits. Chez allows no strings across such a call, which is why
+-- waiting for a piece and fetching it are two calls.
+waiting : String -> String
+waiting f = "C__collect_safe:" ++ f ++ ",libidris2_openrouter"
+
 %foreign lib "or_new"
 prim__new : String -> String -> PrimIO AnyPtr
 
@@ -27,11 +34,14 @@ prim__body : AnyPtr -> String -> PrimIO ()
 %foreign lib "or_timeouts"
 prim__timeouts : AnyPtr -> Int -> Int -> Int -> PrimIO ()
 
-%foreign lib "or_start"
+%foreign waiting "or_start"
 prim__start : AnyPtr -> PrimIO Int
 
 %foreign lib "or_status"
 prim__status : AnyPtr -> PrimIO Int
+
+%foreign waiting "or_wait"
+prim__wait : AnyPtr -> PrimIO ()
 
 %foreign lib "or_next"
 prim__next : AnyPtr -> PrimIO String
@@ -48,8 +58,11 @@ prim__timedOut : AnyPtr -> PrimIO Int
 %foreign lib "or_response_header"
 prim__responseHeader : AnyPtr -> String -> PrimIO String
 
-%foreign lib "or_save"
-prim__save : AnyPtr -> String -> PrimIO Int
+%foreign lib "or_save_to"
+prim__saveTo : AnyPtr -> String -> PrimIO Int
+
+%foreign waiting "or_save_run"
+prim__saveRun : AnyPtr -> PrimIO Int
 
 %foreign lib "or_file_base64"
 prim__fileBase64 : String -> PrimIO String
@@ -166,6 +179,7 @@ header r name = do
 export
 next : HasIO io => Response -> io (Either Failure (Maybe String))
 next r = do
+  primIO (prim__wait r.ptr)
   s <- primIO (prim__next r.ptr)
   if s /= "" then pure (Right (Just s)) else do
     e <- primIO (prim__error r.ptr)
@@ -184,11 +198,13 @@ close r = primIO (prim__free r.ptr)
 export
 save : HasIO io => Response -> (path : String) -> io (Either Failure Nat)
 save r path = do
-  n <- primIO (prim__save r.ptr path)
-  e <- primIO (prim__error r.ptr)
-  if e /= "" then Left <$> failure r.ptr
-    else if n < 0 then pure (Left (Unreachable ("could not write " ++ path)))
-    else pure (Right (cast n))
+  ok <- primIO (prim__saveTo r.ptr path)
+  if ok == 0 then pure (Left (Unreachable ("could not write " ++ path))) else do
+    n <- primIO (prim__saveRun r.ptr)
+    e <- primIO (prim__error r.ptr)
+    if e /= "" then Left <$> failure r.ptr
+      else if n < 0 then pure (Left (Unreachable ("could not write " ++ path)))
+      else pure (Right (cast n))
 
 ||| The rest of the body.
 export

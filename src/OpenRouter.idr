@@ -17,6 +17,7 @@
 ||| are there to import when you need them.
 module OpenRouter
 
+import public OpenRouter.Async
 import public OpenRouter.Client
 import public OpenRouter.JSON
 import public OpenRouter.Message
