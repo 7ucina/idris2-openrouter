@@ -7,6 +7,7 @@ import Data.List
 import Data.String
 import Harness
 import OpenRouter
+import OpenRouter.API as API
 import OpenRouter.HTTP
 import System.Clock
 
@@ -58,7 +59,7 @@ basics c = do
     #"{"model":"mock/echo","messages":[{"role":"system","content":"s"},{"role":"user","content":"u"}],"max_tokens":5,"provider":{"sort":"price"}}"#
   same "the headers the server received"
     (asString (get "referer" echoed), asString (get "agent" echoed), asString (get "extra" echoed))
-    (Just "https://example.com", Just "idris2-openrouter/0.3.0", Just "yes")
+    (Just "https://example.com", Just "idris2-openrouter/0.4.0", Just "yes")
 
   u <- chat c (chatRequest "mock/unknown" ["hi"] [])
   same "a bad request is an API error" (outcome u) "api 400 unknown mock model mock/unknown"
@@ -361,6 +362,232 @@ together c = do
   big <- concurrently 8 (replicate 40 (models c []))
   same "forty requests through eight threads" (map (either (const 0) length) big) (replicate 40 2)
 
+everyEndpoint : Tally => Client -> IO ()
+everyEndpoint c = do
+  section "Mock: the generated endpoint functions"
+  let echo  = withHeaders [("X-Echo", "json")] c
+      said  : Either Error JSON -> List String -> String
+      said r keys = either (\e => "<<" ++ outcome (the (Either Error ()) (Left e)) ++ ">>") (\j => joinBy " " (map (\k => render (get k j)) keys)) r
+  r <- API.listGuardrails echo [("limit", "20"), ("q", "a b")]
+  same "a list, with its query" (said r ["method", "path"]) #""GET" "/api/v1/guardrails?limit=20&q=a%20b""#
+  r <- API.getGuardrail echo "g/1 x"
+  same "a path parameter is encoded" (said r ["method", "path"]) #""GET" "/api/v1/guardrails/g%2F1%20x""#
+  r <- API.updateGuardrail echo "g1" (JObject [("name", JString "n")])
+  same "a PATCH with a body" (said r ["method", "path", "type", "body"]) #""PATCH" "/api/v1/guardrails/g1" "application/json" {"name":"n"}"#
+  r <- API.deleteGuardrail echo "g1"
+  same "a DELETE" (said r ["method", "path", "auth"]) #""DELETE" "/api/v1/guardrails/g1" "Bearer test-key""#
+  r <- API.getGeneration echo "gen-1"
+  same "a required query parameter is an argument" (said r ["path"]) #""/api/v1/generation?id=gen-1""#
+  r <- API.listImageModelEndpoints echo "openai" "gpt-image"
+  same "two path parameters" (said r ["path"]) #""/api/v1/images/models/openai/gpt-image/endpoints""#
+  r <- API.listVideosContent echo "job1" [("index", "0")] "test/build/echo.bin"
+  same "a download that gets JSON instead of a file is an error" (outcome r) "malformed"
+  r <- API.listVideosContent (withHeaders [("X-Echo", "bytes")] c) "job1" [("index", "0")] "test/build/echo.bin"
+  back <- readBase64 "test/build/echo.bin"
+  same "a download is written to its file" (either (const 0) id r, back)
+    (39, Just "AP/+AS9hcGkvdjEvdmlkZW9zL2pvYjEvY29udGVudD9pbmRleD0w")
+  r <- API.createAudioSpeech (withHeaders [("X-Echo", "bytes")] c) (JObject [("model", JString "m")]) "test/build/echo.bin"
+  same "a download with a request body" (either (const 0) id r) 24
+  r <- API.getCreditPurchasesSetupGuide (withHeaders [("X-Echo", "text")] c)
+  same "an endpoint that answers with text" (either (const "") id r) "# /api/v1/credits/purchases"
+  r <- API.deleteBatch (withHeaders [("X-Echo", "empty")] c) "b1"
+  same "an empty success is null" (either (const "error") render r) "null"
+  _ <- saveBase64 "test/build/upload.bin" "AAECAwQF"
+  r <- API.uploadFile echo [("provider", "openai")] [FormFile "file" "test/build/upload.bin", FormField "purpose" "user_data"]
+  same "a multipart upload" (said r ["method", "path", "type", "parts", "files"])
+    #""POST" "/api/v1/files?provider=openai" "multipart/form-data" ["file","purpose"] ["upload.bin"]"#
+  r <- API.uploadFile echo [] [FormFileAs "file" "test/build/upload.bin" "notes.pdf" "application/pdf"]
+  same "an upload under another name and type" (said r ["files", "types"]) #"["notes.pdf"] ["application/pdf"]"#
+  r <- API.createOauthToken echo [("grant_type", "client credentials"), ("a&b", "c=d")]
+  same "form fields are encoded" (said r ["type", "body"])
+    #""application/x-www-form-urlencoded" "grant_type=client%20credentials&a%26b=c%3Dd""#
+  r <- API.createApiAlphaExtractions echo (JObject [])
+  same "an endpoint outside /api/v1 is reached at the host's root" (said r ["path"]) #""/api/alpha/extractions""#
+  r <- API.getModels (withHeaders [("X-Echo", "json")] ({ appTitle := Just "T", appUrl := Just "https://a.b", appCategories := ["x", "y"] } c)) []
+  same "the generated functions go through the same client" (said r ["path", "auth"]) #""/api/v1/models" "Bearer test-key""#
+  r <- API.listGuardrails ({ apiKey := "wrong" } c) []
+  same "and report errors the same way" (said r []) "<<api 401 No auth credentials found>>"
+
+responsesAPI : Tally => Client -> IO ()
+responsesAPI c = do
+  section "Mock: the Responses API"
+  r <- respond c (responsesRequest "mock/r-plain" [say User "Hi"] [])
+  same "a response: text, reasoning, citations, usage"
+    (either (const Nothing) (\x => Just (outputText x, outputReasoning x, map url (outputCitations x), x.status, map totalTokens x.usage, x.usage >>= cost)) r)
+    (Just ("Hello from the Responses API.", "Greeting.", ["https://example.com/a"], "completed", Just 18, Just 0.00003))
+  r <- respond c (responsesRequest "mock/r-echo" [say User "Hi"] [MaxTokens 7, Instructions "Be brief."])
+  same "the request on the wire"
+    (either (const "") (\x => render (either (const JNull) id (parse (outputText x)))) r)
+    #"{"model":"mock/r-echo","input":[{"type":"message","role":"user","content":"Hi"}],"max_output_tokens":7,"instructions":"Be brief."}"#
+  pieces <- newIORef (the (List String) [])
+  r <- respondStream c (responsesRequest "mock/r-plain" [say User "Hi"] []) $ \event =>
+         modifyIORef pieces ((case event of
+           TextDelta t => "text:" ++ t; ReasoningDelta t => "think:" ++ t; ArgumentsDelta t => "args:" ++ t
+           ItemDone _ => "item"; OtherEvent t _ => t) ::)
+  ps <- readIORef pieces
+  same "a streamed response, event by event" (reverse ps)
+    ["response.created", "think:Greeting.", "item", "text:Hello from ", "text:the Responses API.", "item", "args:{}"]
+  same "ends with the whole response" (either (const Nothing) (\x => Just (outputText x, length x.output, map totalTokens x.usage)) r)
+    (Just ("Hello from the Responses API.", 3, Just 18))
+  out <- newIORef ""
+  r <- respondStreamText c (responsesRequest "mock/r-plain" [say User "Hi"] []) (\t => modifyIORef out (++ t))
+  o <- readIORef out
+  same "respondStreamText hands over only text" o "Hello from the Responses API."
+  r <- respondStream c (responsesRequest "mock/r-fail" [say User "Hi"] []) (\_ => pure ())
+  same "a response that fails in the stream" (outcome r) "api 502 Upstream failed"
+  r <- respond ({ retries := 0 } c) (responsesRequest "mock/r-fail" [say User "Hi"] [])
+  same "a response that fails outright" (outcome r) "api 502 Upstream failed"
+  calls <- newIORef (the (List (List Double)) [])
+  let add = handler "add" "Add numbers." (object [prop "numbers" (array number)]) $ \[ns] => do
+              modifyIORef calls (ns ::)
+              pure (show (sum ns))
+  r <- respondWithTools c [add] 3 (responsesRequest "mock/r-tools" [say User "Add 1, 2 and 3.5"] [])
+  cs <- readIORef calls
+  same "tools: called with typed arguments, results and reasoning sent back" (cs, either (const "") outputText r)
+    ([[1.0, 2.0, 3.5]], "The sum is 6.5 (2 items came back).")
+  r <- respondAs c "forecast" forecast (responsesRequest "mock/r-json" [say User "Oslo?"] [])
+  case r of
+    Right ([city, celsius, advice, tags], _) =>
+      same "a typed reply" (city, celsius, advice, tags) ("Oslo", -3.5, Just "forecast", ["json_schema", "True"])
+    Left e => check ("a typed reply: " ++ show e) False
+
+messagesAPI : Tally => Client -> IO ()
+messagesAPI c = do
+  section "Mock: the Anthropic Messages API"
+  r <- createMessage c (messagesRequest "mock/a-plain" 100 [userTurn "Hi"] [])
+  same "a message" (either (const Nothing) (\x => Just (blocksText x.content, x.stopReason, map totalTokens x.usage, x.usage >>= cachedTokens)) r)
+    (Just ("Hello from the Messages API.", Just "end_turn", Just 14, Just 2))
+  r <- createMessage c (messagesRequest "mock/a-echo" 50 [userTurn "Hi"] [Instructions "Be brief.", Temperature 0.5])
+  same "the request on the wire"
+    (either (const "") (\x => render (either (const JNull) id (parse (blocksText x.content)))) r)
+    #"{"model":"mock/a-echo","max_tokens":50,"messages":[{"role":"user","content":[{"type":"text","text":"Hi"}]}],"system":"Be brief.","temperature":0.5}"#
+  let time = tool "get_time" "The time in a city." (object [prop "city" string])
+      req  = messagesRequest "mock/a-tools" 100 [userTurn "What time is it in Paris?"] [Tools [time]]
+  Right r1 <- createMessage c req
+    | Left e => check ("a tool use comes back: " ++ show e) False
+  same "the model asks for a tool" (map (\t => (t.id, t.name, t.arguments)) (toolUses r1.content), r1.stopReason)
+    ([("toolu_1", "get_time", #"{"city":"Paris"}"#)], Just "tool_use")
+  r2 <- createMessage c ({ messages $= (++ [replyTurn r1, MkTurn User [ToolOutput "toolu_1" "noon" False]]) } req)
+  same "and answers once it has the result" (either (const "") (blocksText . content) r2) "It is noon."
+  events <- newIORef (the (List String) [])
+  r <- streamMessage c (messagesRequest "mock/a-plain" 100 [userTurn "Hi"] []) $ \event =>
+         modifyIORef events ((case event of
+           TextPiece t => "text:" ++ t; ThinkingPiece t => "think:" ++ t; InputPiece t => "input:" ++ t
+           BlockDone _ => "block"; OtherMessageEvent t _ => t) ::)
+  es <- readIORef events
+  same "a streamed message, event by event" (reverse es)
+    ["think:Greet ", "think:them.", "block", "text:Hello from ", "text:the Messages API.", "block", #"input:{"q": "#, #"input:"x"}"#, "block"]
+  same "ends with the whole message, its blocks assembled"
+    (either (const Nothing) (\x => Just (render (toJSON x.content), x.stopReason, map (\u => (u.promptTokens, u.completionTokens)) x.usage)) r)
+    (Just ( #"[{"type":"thinking","thinking":"Greet them.","signature":"sig9"},{"type":"text","text":"Hello from the Messages API."},{"type":"tool_use","id":"toolu_2","name":"lookup","input":{"q":"x"}}]"#
+          , Just "tool_use", Just (9, 5) ))
+  out <- newIORef ""
+  _ <- streamMessageText c (messagesRequest "mock/a-plain" 100 [userTurn "Hi"] []) (\t => modifyIORef out (++ t))
+  o <- readIORef out
+  same "streamMessageText hands over only text" o "Hello from the Messages API."
+  r <- streamMessage c (messagesRequest "mock/a-overloaded" 100 [userTurn "Hi"] []) (\_ => pure ())
+  same "an error in the stream" (outcome r) "api 200 Overloaded"
+
+jobs : Tally => Client -> IO ()
+jobs c = do
+  section "Mock: rerank, video, files, batches"
+  r <- rerank c (rerankRequest "mock/rerank" "capital of France" ["Berlin is in Germany.", "Paris is the capital of France.", "France makes wine."] [TopN 2])
+  same "documents come back best first" (either (const []) (map (\x => (x.index, x.document)) . results) r)
+    [(1, Just "Paris is the capital of France."), (2, Just "France makes wine.")]
+
+  _ <- call c GET "/../../_reset" [] Nothing
+  Right job <- submitVideo c (videoRequest "mock/video" "a cat" [Duration 4])
+    | Left e => check ("a video job starts: " ++ show e) False
+  same "a video job starts pending" (job.id, job.status) ("job-1", Pending)
+  early <- videoJob c job.id
+  same "and is in progress" (either (const Nothing) (Just . status) early) (Just InProgress)
+  done <- awaitVideo c job.id 0 10
+  same "awaitVideo waits for it" (either (const Nothing) (\x => Just (x.status, x.urls, x.cost)) done)
+    (Just (Completed, ["http://127.0.0.1/v/job-1/0.mp4"], Just 0.25))
+  n <- downloadVideo c job.id 0 "test/build/video.mp4"
+  back <- readBase64 "test/build/video.mp4"
+  same "and the video downloads" (either (const 0) id n, back) (19, Just "AAAAGGZ0eXBtcDQyaW5kZXg9MA==")
+  Right bad <- submitVideo c (videoRequest "mock/video" "refuse this" [])
+    | Left e => check ("a second job starts: " ++ show e) False
+  failed <- awaitVideo c bad.id 0 10
+  same "a job that fails says why" (either (const Nothing) (\x => Just (x.status, x.error)) failed) (Just (Failed, Just "Prompt was refused"))
+  stuck <- awaitVideo c "job-1" 0 0
+  same "awaiting with no tries just looks" (either (const Nothing) (Just . status) stuck) (Just Completed)
+  r <- submitVideo c (videoRequest "mock/no-video" "a cat" [])
+  same "a video request that is refused" (outcome r) "api 400 Model cannot make videos"
+  r <- videoJob c "job-nope"
+  same "a job that does not exist" (outcome r) "api 404 Job not found"
+
+  _ <- saveBase64 "test/build/notes.txt" "aGVsbG8gZmlsZQ=="
+  Right f <- storeFile c "test/build/notes.txt"
+    | Left e => check ("a file uploads: " ++ show e) False
+  same "an uploaded file" (f.id, f.filename, f.mediaType, f.size, f.downloadable) ("file-1", "notes.txt", Just "text/plain", Just 10, False)
+  fs <- storedFiles c []
+  i <- fileInfo c "file-1"
+  same "is listed and looked up" (either (const []) (map (.id)) fs, either (const "") filename i) (["file-1"], "notes.txt")
+  d <- downloadFile c "file-1" "test/build/dl.bin"
+  same "an uploaded file cannot be downloaded" (outcome d) "api 400 Uploaded files cannot be downloaded"
+  x <- removeFile c "file-1"
+  fs <- storedFiles c []
+  same "and is deleted" (outcome x, either (const [""]) (map (.id)) fs) ("ok", [])
+  x <- removeFile c "file-1"
+  same "deleting it again fails" (outcome x) "api 404 Not found"
+  r <- storeFile c "test/build/no-such-file"
+  same "uploading a file that is not there" (outcome r) "unreachable"
+
+  let item : String -> String -> BatchItem
+      item i q = MkBatchItem i (toJSON (chatRequest "mock/plain" [user q] []))
+  Right b <- createBatch c "/v1/chat/completions" "mock/plain" [item "a" "one", item "b" "two", item "c" "three"]
+    | Left e => check ("a batch is created: " ++ show e) False
+  same "a new batch" (b.id, b.status, b.requests, b.completed, batchFinished b) ("batch-1", "validating", 3, 0, False)
+  done <- awaitBatch c b.id 0 10
+  same "awaitBatch waits for the results"
+    (either (const Nothing) (\x => Just (x.status, x.completed, x.failed, map (\r => (r.customId, text (chatResponseFromJSON r.body), r.error)) x.results)) done)
+    (Just ("completed", 2, 1, [("a", "batched: one", Nothing), ("b", "batched: two", Nothing), ("c", "", Just "Bad request in batch")]))
+  bs <- batches c []
+  x <- cancelBatch c b.id
+  bs' <- batches c []
+  same "batches are listed and deleted" (either (const []) (map (.id)) bs, outcome x, either (const [""]) (map (.id)) bs') (["batch-1"], "ok", [])
+
+management : Tally => Client -> IO ()
+management c = do
+  section "Mock: catalog, keys, sign-in"
+  m <- modelInfo c "mock/plain"
+  same "one model, with its voices" (either (const Nothing) (\x => Just (x.name, x.contextLength, x.voices)) m) (Just ("Mock Plain", Just 128000, ["ada", "bo"]))
+  ms <- availableModels c []
+  z <- zdrEndpoints c
+  ts <- serverTools c
+  same "the models an account may use, ZDR endpoints, server tools"
+    (either (const []) (map (.id)) ms, either (const []) (map providerName) z, either (const []) (mapMaybe (asString . get "type")) ts)
+    (["mock/allowed"], ["Mock"], ["openrouter:web_search", "openrouter:datetime"])
+  g <- generationContent c "gen-mock-1"
+  same "a generation's stored content" (either (const "") (render . path ["output", "completion"]) g) #""You said: hi""#
+  x <- reportGeneration c "gen-mock-1" "latency" "too slow"
+  y <- reportGeneration c "gen-nope" "other" ""
+  same "feedback on a generation" (outcome x, outcome y) ("ok", "api 404 Generation not found")
+  a <- activity c [("date", "2026-01-01")]
+  same "activity rows" (either (const []) (map (\r => (asString (get "model" r), asDouble (get "usage" r), asString (get "query" r)))) a)
+    [(Just "mock/plain", Just 0.5, Just "date=2026-01-01")]
+
+  Right (k, secret) <- createKey c "ci" (Just 5)
+    | Left e => check ("a key is created: " ++ show e) False
+  same "a new key, with its secret shown once" (k.name, k.hash, k.limit, k.disabled, secret) (Just "ci", Just "hash1", Just 5.0, False, "sk-or-v1-secret-hash1")
+  _ <- createKey c "dev" Nothing
+  ks <- apiKeys c []
+  same "keys are listed" (either (const []) (map (\x => (x.name, x.limit))) ks) [(Just "ci", Just 5.0), (Just "dev", Nothing)]
+  u <- updateKey c "hash1" [("disabled", JBool True), ("name", JString "ci-old")]
+  one <- apiKeyInfo c "hash1"
+  same "a key is changed" (either (const Nothing) (\x => Just (x.name, x.disabled)) u, either (const Nothing) (\x => Just (x.name, x.disabled)) one)
+    (Just (Just "ci-old", True), Just (Just "ci-old", True))
+  x <- deleteKey c "hash1"
+  gone <- apiKeyInfo c "hash1"
+  same "and deleted" (outcome x, outcome gone) ("ok", "api 404 Key not found")
+
+  k <- exchangeAuthCode ({ apiKey := "" } c) "good-code" (Just ("verif", "S256"))
+  same "a sign-in code is exchanged for the user's key" (either (const "") id k) "sk-or-v1-user-verif-S256"
+  k <- exchangeAuthCode ({ apiKey := "" } c) "bad-code" Nothing
+  same "a bad code is refused" (outcome k) "api 403 Invalid code"
+
 export
 mockTests : Tally => (url : String) -> IO ()
 mockTests url = do
@@ -373,3 +600,8 @@ mockTests url = do
   others c
   media c
   together c
+  everyEndpoint c
+  responsesAPI c
+  messagesAPI c
+  jobs c
+  management c

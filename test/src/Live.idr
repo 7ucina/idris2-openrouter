@@ -1,5 +1,5 @@
 ||| The client against openrouter.ai. The catalog endpoints need no key and
-||| cost nothing. About twenty small paid requests (around a cent in all, most
+||| cost nothing. About thirty small paid requests (around a cent in all, most
 ||| of it one generated image) run only when OPENROUTER_API_KEY is set.
 module Live
 
@@ -10,6 +10,7 @@ import Data.Nat
 import Data.String
 import Harness
 import OpenRouter
+import OpenRouter.API as API
 
 %default covering
 
@@ -36,6 +37,13 @@ liveTests = do
 
   ps <- providers anon
   check "there are providers, with slugs" (either (const False) (\xs => length xs > 10 && all (\p => p.slug /= "") xs) ps)
+
+  z <- zdrEndpoints anon
+  check "there are zero-data-retention endpoints" (either (const False) (\x => length x > 10) z)
+  g <- API.getModel anon "openai" "gpt-4o-mini"
+  check "a generated endpoint function answers" (either (const False) (\j => asString (path ["data", "id"] j) == Just "openai/gpt-4o-mini") g)
+  l <- API.listProviders anon
+  check "and another" (either (const False) (\j => length (asList (get "data" j)) > 10) l)
 
   em <- embeddingModels anon
   check "there are embedding models" (either (const False) (not . null) em)
@@ -139,6 +147,62 @@ liveTests = do
     | Nothing => check "the image is read back" False
   v <- chat c (chatRequest mini [userParts [Text "What animal is this? One word.", Image picture]] [MaxTokens 10])
   check ("and recognized when sent back as input: " ++ either show text v) (either (const False) (isInfixOf "fox" . toLower . text) v)
+
+  r <- respond c (responsesRequest mini [say User "Reply with the single word: pong"] [MaxTokens 16])
+  check ("the Responses API: " ++ either show outputText r)
+    (either (const False) (\x => isInfixOf "pong" (toLower (outputText x)) && x.status == "completed" && isJust (x.usage >>= cost)) r)
+  out <- newIORef ""
+  r <- respondStreamText c (responsesRequest mini [say User "Count from 1 to 5, digits only."] [MaxTokens 30]) (\t => modifyIORef out (++ t))
+  o <- readIORef out
+  check ("a streamed response: " ++ either show outputText r) (either (const False) (\x => outputText x == o && isInfixOf "5" o) r)
+  sums <- newIORef (the (List Double) [])
+  let add = handler "add" "Add numbers." (object [prop "numbers" (array number)]) $ \[ns] => do
+              modifyIORef sums (sum ns ::)
+              pure (show (sum ns))
+  r <- respondWithTools c [add] 3 (responsesRequest mini [say User "Use the add tool to add 12.5, 30 and 0.25, then state the result."] [Temperature 0])
+  ss <- readIORef sums
+  check ("a tool loop over the Responses API: " ++ either show outputText r) (ss == [42.75] && either (const False) (isInfixOf "42.75" . outputText) r)
+  s <- respondAs c "capital" (object [prop "country" string, prop "capital" string]) (responsesRequest mini [say User "The capital of Norway."] [Temperature 0])
+  check "a typed reply from the Responses API" (case s of Right ([_, capital], _) => capital == "Oslo"; _ => False)
+
+  let haiku = "anthropic/claude-haiku-4.5"
+  m <- createMessage c (messagesRequest haiku 30 [userTurn "Reply with the single word: pong"] [])
+  check ("the Anthropic Messages API: " ++ either show (blocksText . content) m)
+    (either (const False) (\x => isInfixOf "pong" (toLower (blocksText x.content)) && x.stopReason == Just "end_turn" && isJust (x.usage >>= cost)) m)
+  out <- newIORef ""
+  m <- streamMessageText c (messagesRequest haiku 40 [userTurn "Count from 1 to 5, digits only."] [Instructions "Be terse."]) (\t => modifyIORef out (++ t))
+  o <- readIORef out
+  check ("a streamed message: " ++ either show (blocksText . content) m)
+    (either (const False) (\x => blocksText x.content == o && isInfixOf "5" o && isJust x.stopReason) m)
+  let time = tool "get_time" "The current time in a city." (object [prop "city" string])
+  m <- createMessage c (messagesRequest haiku 200 [userTurn "What time is it in Paris? Use the tool."] [Tools [time], ToolChoice Required])
+  check ("a tool use from the Messages API: " ++ either show (show . map arguments . toolUses . content) m)
+    (either (const False) (\x => map name (toolUses x.content) == ["get_time"] && x.stopReason == Just "tool_use") m)
+
+  rr <- rerank c (rerankRequest "cohere/rerank-v3.5" "capital of France" ["Berlin is in Germany.", "Paris is the capital of France.", "France makes wine."] [TopN 2])
+  check ("rerank puts the right document first: " ++ either show (show . map index . results) rr)
+    (either (const False) (\x => map index (take 1 x.results) == [1] && length x.results == 2) rr)
+
+  d <- chat c (chatRequest mini ["What year is it? Use the tool, then answer with the year only."] [ServerTools [serverTool "openrouter:datetime" []], MaxTokens 40])
+  check ("a server tool runs on OpenRouter's side: " ++ either show text d)
+    (either (const False) (\x => any (\y => isInfixOf y (text x)) ["2026", "2027", "2028", "2029"]) d)
+
+  _ <- saveBase64 "test/build/live-notes.txt" "VGhlIHNlY3JldCB3b3JkIGlzIHBlbGljYW4uCg=="
+  f <- storeFile c "test/build/live-notes.txt"
+  check ("a file is stored: " ++ either show (.filename) f) (either (const False) (\x => x.filename == "live-notes.txt" && x.size == Just 28) f)
+  fs <- storedFiles c []
+  check "and listed" (either (const False) (any (\x => Just x.id == map (.id) (either (const Nothing) Just f))) fs)
+  x <- maybe (pure (Left (Malformed "no file" ""))) (removeFile c . (.id)) (either (const Nothing) Just f)
+  check "and removed" (either (const False) (const True) x)
+
+  mi <- modelInfo c mini
+  check "one model is looked up" (either (const False) (\x => x.id == mini && isJust x.contextLength) mi)
+  am <- availableModels c []
+  check "the account's models are listed" (either (const False) (\x => length x > 50) am)
+  st <- serverTools c
+  check "server tools are listed" (either (const False) (not . null) st)
+  ks <- apiKeys c []
+  check "a management endpoint refuses an ordinary key" (case ks of Left (Api e) => e.status == 401 || e.status == 403; _ => False)
 
   k <- keyInfo c
   putStrLn ("  key: " ++ either show (\x => x.label ++ ", used $" ++ maybe "?" show x.usage ++ ", limit " ++ maybe "none" show x.limit) k)

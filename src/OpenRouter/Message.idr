@@ -65,6 +65,8 @@ data Part : Type where
   File    : (filename : String) -> (fileData : String) -> Part
   ||| Base64 audio, with its format: `"wav"` or `"mp3"`.
   Audio   : (base64 : String) -> (format : String) -> Part
+  ||| A video, by URL or as a data URI.
+  Video   : (url : String) -> Part
   ||| The part, marked as a prompt cache breakpoint.
   Cached  : Part -> Part
   ||| A part this type has no constructor for, sent as given.
@@ -93,6 +95,8 @@ partJSON (File n d) =
 partJSON (Audio b f) =
   JObject [ ("type", JString "input_audio")
           , ("input_audio", JObject [("data", JString b), ("format", JString f)]) ]
+partJSON (Video u) =
+  JObject [("type", JString "video_url"), ("video_url", JObject [("url", JString u)])]
 partJSON (Cached p) = case partJSON p of
   JObject fs => JObject (fs ++ [("cache_control", JObject [("type", JString "ephemeral")])])
   j          => j

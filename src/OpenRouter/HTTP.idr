@@ -5,6 +5,7 @@
 module OpenRouter.HTTP
 
 import Data.String
+import public OpenRouter.Wire
 
 %default total
 
@@ -30,6 +31,12 @@ prim__header : AnyPtr -> String -> PrimIO ()
 
 %foreign lib "or_body"
 prim__body : AnyPtr -> String -> PrimIO ()
+
+%foreign lib "or_form_field"
+prim__formField : AnyPtr -> String -> String -> PrimIO ()
+
+%foreign lib "or_form_file"
+prim__formFile : AnyPtr -> String -> String -> String -> String -> PrimIO ()
 
 %foreign lib "or_timeouts"
 prim__timeouts : AnyPtr -> Int -> Int -> Int -> PrimIO ()
@@ -83,17 +90,6 @@ prim__free : AnyPtr -> PrimIO ()
 -- Requests
 --------------------------------------------------------------------------------
 
-public export
-data Method = GET | POST | PUT | PATCH | DELETE
-
-export
-Show Method where
-  show GET    = "GET"
-  show POST   = "POST"
-  show PUT    = "PUT"
-  show PATCH  = "PATCH"
-  show DELETE = "DELETE"
-
 ||| Time limits, in milliseconds. `0` turns a limit off.
 public export
 record Timeouts where
@@ -112,21 +108,10 @@ record Request where
   url      : String
   headers  : List (String, String)
   body     : Maybe String
+  ||| When not empty, the body is these parts as `multipart/form-data`, and
+  ||| `body` is ignored.
+  form     : List FormPart
   timeouts : Timeouts
-
-||| Why no response came back.
-public export
-data Failure : Type where
-  ||| The request ran out of time.
-  TimedOut   : (why : String) -> Failure
-  ||| Anything else: no route, a refused connection, a TLS failure, a
-  ||| connection that dropped.
-  Unreachable : (why : String) -> Failure
-
-export
-Show Failure where
-  show (TimedOut why)    = "timed out: " ++ why
-  show (Unreachable why) = why
 
 --------------------------------------------------------------------------------
 -- Responses
@@ -157,7 +142,12 @@ send r = do
   p <- primIO (prim__new (show r.method) r.url)
   if prim__nullAnyPtr p /= 0 then pure (Left (Unreachable "libcurl could not start a request")) else do
     for_ r.headers $ \(k, v) => primIO (prim__header p (k ++ ": " ++ v))
-    for_ r.body $ \b => primIO (prim__body p b)
+    case r.form of
+      [] => for_ r.body $ \b => primIO (prim__body p b)
+      ps => for_ ps $ \part => case part of
+        FormField n v        => primIO (prim__formField p n v)
+        FormFile n f         => primIO (prim__formFile p n f "" "")
+        FormFileAs n f fn ty => primIO (prim__formFile p n f fn ty)
     primIO (prim__timeouts p (cast r.timeouts.connect) (cast r.timeouts.overall) (cast r.timeouts.idle))
     ok <- primIO (prim__start p)
     if ok == 0

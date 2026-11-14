@@ -84,10 +84,16 @@ data Format : Type where
   JSONObject : Format
   ||| JSON that fits a schema.
   JSONSchema : (name : String) -> (strict : Bool) -> (schema : JSON) -> Format
+  ||| Text that fits a grammar, for providers that take one.
+  Grammar    : String -> Format
+  ||| Plain text: the default, stated.
+  PlainText  : Format
 
 export
 ToJSON Format where
   toJSON JSONObject         = JObject [("type", JString "json_object")]
+  toJSON (Grammar g)        = JObject [("type", JString "grammar"), ("grammar", JString g)]
+  toJSON PlainText          = JObject [("type", JString "text")]
   toJSON (JSONSchema n s j) = JObject
     [ ("type", JString "json_schema")
     , ("json_schema", JObject [("name", JString n), ("strict", JBool s), ("schema", j)]) ]
@@ -102,15 +108,17 @@ schemaFormat n s = JSONSchema n True (jsonSchema s)
 --------------------------------------------------------------------------------
 
 public export
-data EffortLevel = Minimal | Low | Medium | High | XHigh
+data EffortLevel = NoEffort | Minimal | Low | Medium | High | XHigh | Max
 
 export
 Show EffortLevel where
+  show NoEffort = "none"
   show Minimal = "minimal"
   show Low     = "low"
   show Medium  = "medium"
   show High    = "high"
   show XHigh   = "xhigh"
+  show Max     = "max"
 
 public export
 data ReasoningOption : Type where
@@ -161,6 +169,10 @@ data ProviderOption : Type where
   Sort              : SortBy -> ProviderOption
   ||| The most to pay, in dollars per million tokens: `[("prompt", 1), ("completion", 2)]`.
   MaxPrice          : List (String, Double) -> ProviderOption
+  ||| Prefer endpoints that generate at least this many tokens a second.
+  MinThroughput     : Double -> ProviderOption
+  ||| Prefer endpoints that start answering within this many seconds.
+  MaxLatency        : Double -> ProviderOption
   ||| Any other routing preference.
   ProviderField     : String -> JSON -> ProviderOption
 
@@ -178,6 +190,8 @@ providerField (Sort Price)           = ("sort", JString "price")
 providerField (Sort Throughput)      = ("sort", JString "throughput")
 providerField (Sort Latency)         = ("sort", JString "latency")
 providerField (MaxPrice ps)          = ("max_price", JObject (map (map JNum) ps))
+providerField (MinThroughput x)      = ("preferred_min_throughput", JNum x)
+providerField (MaxLatency x)         = ("preferred_max_latency", JNum x)
 providerField (ProviderField k v)    = (k, v)
 
 --------------------------------------------------------------------------------
@@ -224,6 +238,32 @@ data Option : Type where
   Modalities          : List String -> Option
   ||| A stable id for your end user, which helps OpenRouter detect abuse.
   EndUser             : String -> Option
+  ||| Tools that OpenRouter runs itself, such as web search, each as its
+  ||| JSON object. They are sent along with the `Tools`. See `serverTool`.
+  ServerTools         : List JSON -> Option
+  ||| An id that groups related requests, such as one conversation, in
+  ||| OpenRouter's logs.
+  SessionId           : String -> Option
+  ||| Up to 16 pairs of your own, kept with the request's record.
+  Metadata            : List (String, String) -> Option
+  ||| The processing tier: `"auto"`, `"default"`, `"flex"`, `"priority"`.
+  ServiceTier         : String -> Option
+  ||| Text the reply is expected to mostly repeat, such as a file being
+  ||| edited, which lets some models answer faster.
+  Prediction          : String -> Option
+  ||| A key that routes requests with the same prefix to the same cache.
+  PromptCacheKey      : String -> Option
+  ||| Cache the prompt automatically, where the provider can.
+  AutoCache           : Bool -> Option
+  ||| Return, on the first chunk of a stream, the request as OpenRouter sent
+  ||| it to the provider. For debugging; never use it in production.
+  EchoUpstream        : Bool -> Option
+  ||| Rerank: return only the best `n` documents.
+  TopN                : Nat -> Option
+  ||| Video: the clip's length in seconds.
+  Duration            : Nat -> Option
+  ||| Video: generate a soundtrack as well.
+  GenerateAudio       : Bool -> Option
   ||| Chat: speak the reply, in this voice (`"alloy"`) and format (`"wav"`,
   ||| `"mp3"`, `"pcm16"`). Needs `Modalities ["text", "audio"]`, a model with
   ||| audio output, and a streamed request. See `spoken`.
@@ -277,6 +317,15 @@ export
 spoken : (voice : String) -> (format : String) -> List Option
 spoken voice format = [Modalities ["text", "audio"], AudioOutput voice format]
 
+||| A tool that OpenRouter runs on the model's behalf, by its type and with
+||| its settings: `serverTool "openrouter:web_search" []`. `serverTools`
+||| in `OpenRouter.Client` lists the ones there are.
+export
+serverTool : (type : String) -> (settings : List (String, JSON)) -> JSON
+serverTool t settings = JObject (("type", JString t) :: settings)
+
+||| The JSON field one option sets.
+export
 optionField : Option -> (String, JSON)
 optionField (Temperature x)         = ("temperature", JNum x)
 optionField (TopP x)                = ("top_p", JNum x)
@@ -304,6 +353,17 @@ optionField (Plugins ps)            = ("plugins", JArray ps)
 optionField (Transforms ts)         = ("transforms", toJSON ts)
 optionField (Modalities ms)         = ("modalities", toJSON ms)
 optionField (EndUser u)             = ("user", JString u)
+optionField (ServerTools ts)        = ("tools", JArray ts)
+optionField (SessionId i)           = ("session_id", JString i)
+optionField (Metadata ps)           = ("metadata", JObject (map (map JString) ps))
+optionField (ServiceTier t)         = ("service_tier", JString t)
+optionField (Prediction text)       = ("prediction", JObject [("type", JString "content"), ("content", JString text)])
+optionField (PromptCacheKey k)      = ("prompt_cache_key", JString k)
+optionField (AutoCache b)           = ("cache_control", if b then JObject [("type", JString "ephemeral")] else JNull)
+optionField (EchoUpstream b)        = ("debug", JObject [("echo_upstream_body", JBool b)])
+optionField (TopN n)                = ("top_n", toJSON n)
+optionField (Duration n)            = ("duration", toJSON n)
+optionField (GenerateAudio b)       = ("generate_audio", JBool b)
 optionField (AudioOutput v f)       = ("audio", JObject [("voice", JString v), ("format", JString f)])
 optionField (Voice v)               = ("voice", JString v)
 optionField (SpeechFormat f)        = ("response_format", JString f)
@@ -326,7 +386,24 @@ optionField (Field k v)             = (k, v)
 ||| of the same name.
 export
 optionFields : List Option -> List (String, JSON)
-optionFields = lastWins . map optionField
+optionFields os = lastWins (map field os)
+  where
+    -- function tools and server tools share the one `tools` array; of each
+    -- kind, the last given wins
+    functions : List JSON
+    functions = case mapMaybe (\o => case o of { Tools ts => Just ts; _ => Nothing }) os of
+      [] => []
+      xs => map toJSON (last ([] :: xs))
+
+    servers : List JSON
+    servers = case mapMaybe (\o => case o of { ServerTools ts => Just ts; _ => Nothing }) os of
+      [] => []
+      xs => last ([] :: xs)
+
+    field : Option -> (String, JSON)
+    field (Tools _)       = ("tools", JArray (functions ++ servers))
+    field (ServerTools _) = ("tools", JArray (functions ++ servers))
+    field o               = optionField o
 
 --------------------------------------------------------------------------------
 -- Chat requests
@@ -497,3 +574,50 @@ export
 ToJSON TranscriptionRequest where
   toJSON r = JObject $ lastWins $
     [("model", JString r.model), ("input_audio", toJSON r.audio)] ++ optionFields r.options
+
+--------------------------------------------------------------------------------
+-- Rerank requests
+--------------------------------------------------------------------------------
+
+||| A request to order documents by how well they answer a query. Useful
+||| options: `TopN`, `Provider`.
+public export
+record RerankRequest where
+  constructor MkRerankRequest
+  model     : String
+  query     : String
+  documents : List String
+  options   : List Option
+
+public export
+rerankRequest : (model : String) -> (query : String) -> (documents : List String) -> List Option
+             -> RerankRequest
+rerankRequest = MkRerankRequest
+
+export
+ToJSON RerankRequest where
+  toJSON r = JObject $ lastWins $
+    [("model", JString r.model), ("query", JString r.query), ("documents", toJSON r.documents)]
+      ++ optionFields r.options
+
+--------------------------------------------------------------------------------
+-- Video requests
+--------------------------------------------------------------------------------
+
+||| A request to make a video from a prompt. Useful options: `Duration`,
+||| `AspectRatio`, `Resolution`, `GenerateAudio`, `References`, `Seed`.
+public export
+record VideoRequest where
+  constructor MkVideoRequest
+  model   : String
+  prompt  : String
+  options : List Option
+
+public export
+videoRequest : (model : String) -> (prompt : String) -> List Option -> VideoRequest
+videoRequest = MkVideoRequest
+
+export
+ToJSON VideoRequest where
+  toJSON r = JObject $ lastWins $
+    [("model", JString r.model), ("prompt", JString r.prompt)] ++ optionFields r.options

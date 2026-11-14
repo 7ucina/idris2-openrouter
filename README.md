@@ -3,9 +3,10 @@
 [![test](https://github.com/7ucina/idris2-openrouter/actions/workflows/test.yml/badge.svg)](https://github.com/7ucina/idris2-openrouter/actions/workflows/test.yml)
 
 A client for the [OpenRouter](https://openrouter.ai) API in [Idris 2](https://www.idris-lang.org):
-chat, streaming, tool calls with typed arguments, structured output with typed results,
-images and audio in both directions, requests run concurrently, text completions,
-embeddings, and the catalog and account endpoints.
+the whole of it. Typed functions cover what programs mostly use: chat, streaming, tools with
+typed arguments, structured output with typed results, the Responses and Anthropic Messages
+APIs, images, audio, video, embeddings, reranking, files, batches and key management. A
+generated module has a function for every one of the API's 174 endpoints.
 
 ```idris
 import OpenRouter
@@ -198,19 +199,107 @@ Streams can run side by side the same way. These are operating system threads, a
 thread waiting on the network does not hold up the rest of the program. A task cannot be
 cancelled from outside; give requests a `requestTimeout` instead.
 
+### Web search and other server tools
+
+OpenRouter can run some tools itself. Pass them as `ServerTools`; they sit beside your own
+`Tools` in the request. The sources a reply cites come back as `replyCitations`.
+
+```idris
+Right reply <- chat client $ chatRequest model ["What changed in Idris 2 this year?"]
+    [ServerTools [serverTool "openrouter:web_search" []]]
+for_ (replyCitations reply) $ \source => putStrLn source.url
+```
+
+`serverTools client` lists the tools there are.
+
+### The Responses API
+
+OpenAI's newer request shape, which OpenRouter serves for every model. It takes the same
+options, tools and schemas as chat:
+
+```idris
+Right r <- respond client (responsesRequest model [say User "Hello"] [Instructions "Be brief."])
+putStrLn (outputText r)
+```
+
+`respondStream` and `respondStreamText` stream it, `respondAs` returns a typed reply, and
+`respondWithTools` runs a tool loop with the same `Handler`s as `runTools`. A response's
+`output` is a list of typed items (messages, reasoning, tool calls), and `outputItems` turns
+it back into input for the next request.
+
+### The Anthropic Messages API
+
+Anthropic's request shape, which OpenRouter also serves for every model:
+
+```idris
+Right m <- createMessage client $
+    messagesRequest "anthropic/claude-haiku-4.5" 1024 [userTurn "Hello"] [Instructions "Be brief."]
+putStrLn (blocksText m.content)
+```
+
+Content is a list of typed blocks (`TextBlock`, `ToolUse`, `ToolOutput`, `Thinking`,
+`ImageBlock`), `streamMessage` and `streamMessageText` stream it and assemble the blocks,
+and `Reasoning [Budget 2048]` turns thinking on.
+
+### Rerank, video, files, batches
+
+```idris
+-- order documents by how well they answer a query
+Right ranked <- rerank client (rerankRequest "cohere/rerank-v3.5" query documents [TopN 3])
+
+-- make a video: submit, wait, download
+Right job   <- submitVideo client (videoRequest model "a paper boat on a pond" [Duration 5])
+Right done  <- awaitVideo client job.id 10 60        -- look every 10 s, at most 60 times
+Right bytes <- downloadVideo client job.id 0 "boat.mp4"
+
+-- store a file with OpenRouter, to refer to by id
+Right file <- storeFile client "report.pdf"
+
+-- run requests in the background, at a discount
+Right b    <- createBatch client "/v1/chat/completions" model
+                [MkBatchItem "first" (toJSON request1), MkBatchItem "second" (toJSON request2)]
+Right done <- awaitBatch client b.id 60 120
+for_ done.results $ \r => putStrLn (r.customId ++ ": " ++ text (chatResponseFromJSON r.body))
+```
+
 ### Everything else
 
 | Function | What it does |
 | --- | --- |
 | `ask` | One prompt in, the reply's text out. |
-| `generateImage`, `speech`, `transcribe` | Images, text to speech and speech to text, as above. |
 | `complete`, `completeStream` | Text completions (`/completions`). |
 | `embed` | Embeddings: one vector per input, in input order. |
-| `models`, `modelCount`, `embeddingModels` | The catalog, with prices, context lengths and supported parameters. No key needed. |
-| `modelEndpoints`, `providers` | Who serves a model, at what price and uptime. No key needed. |
-| `keyInfo`, `credits` | The key's limit and spending; credits bought and used. |
-| `generation` | What a past request cost and how long it took, by the `id` of its response. |
-| `call` | Any other endpoint: a method, a path, a query and a JSON body. |
+| `models`, `modelInfo`, `modelCount`, `embeddingModels`, `availableModels` | The catalog, with prices, context lengths and supported parameters. |
+| `modelEndpoints`, `zdrEndpoints`, `providers`, `serverTools` | Who serves a model, at what price and uptime; endpoints that keep no data. |
+| `keyInfo`, `credits`, `activity` | The key's limit and spending; credits bought and used; spending by day. |
+| `generation`, `generationContent`, `reportGeneration` | What a past request cost, what it said, and feedback on it. |
+| `apiKeys`, `createKey`, `apiKeyInfo`, `updateKey`, `deleteKey` | Managing API keys (needs a management key). |
+| `authorizationURL`, `exchangeAuthCode` | Letting a user sign in and bring their own key (OAuth with PKCE). |
+| `storedFiles`, `fileInfo`, `removeFile`, `downloadFile` | Managing stored files. |
+| `batches`, `batchStatus`, `cancelBatch` | Managing batches. |
+
+### Every other endpoint
+
+`OpenRouter.API` has a function for each of the API's 174 operations: guardrails,
+workspaces, presets, analytics, private endpoints, and the rest. It is generated from
+OpenRouter's own OpenAPI description, so it is complete by construction, and running
+`tools/generate_api.py` again brings it up to date.
+
+```idris
+import OpenRouter
+import OpenRouter.API as API
+
+Right guardrails <- API.listGuardrails client [("limit", "20")]
+Right created    <- API.createGuardrail client (JObject [("name", JString "No PII")])
+Right _          <- API.deleteGuardrail client guardrailId
+```
+
+These functions are thin: path parameters and required query parameters are arguments,
+optional query parameters are a list, and bodies and results are `JSON` (read with `get`,
+`path` and the `as...` functions). They share the client's key, retries, timeouts and
+errors. Underneath are five calls you can also use directly: `call` (JSON), `callText`,
+`callForm`, `upload` (multipart) and `download` (bytes to a file), plus `openEventStream`
+for any endpoint that streams.
 
 ## Errors and retries
 
@@ -259,7 +348,7 @@ data Error
 
 | Module | Contents |
 | --- | --- |
-| `OpenRouter` | Re-exports everything below except `HTTP` and `SSE`. |
+| `OpenRouter` | Re-exports everything below except `API`, `HTTP` and `SSE`. |
 | `OpenRouter.Client` | `Client` and every function that talks to the API. |
 | `OpenRouter.Request` | `ChatRequest`, `Option`, tools, response formats, provider routing, and the image, speech and transcription requests. |
 | `OpenRouter.Message` | Messages, content parts, tool calls. |
@@ -268,20 +357,25 @@ data Error
 | `OpenRouter.Schema` | Typed JSON Schemas. |
 | `OpenRouter.Tools` | `Handler` and `runTools`. |
 | `OpenRouter.Async` | `async`, `await`, `concurrently`, `chatAll`. |
-| `OpenRouter.Model` | Models, endpoints, providers, key, credits, generations. |
+| `OpenRouter.Responses` | The Responses API. |
+| `OpenRouter.Anthropic` | The Anthropic Messages API. |
+| `OpenRouter.API` | A function for every endpoint, generated from the OpenAPI description. |
+| `OpenRouter.Model` | Models, endpoints, providers, keys, credits, generations, files, batches. |
 | `OpenRouter.JSON` | A JSON value type, parser and printers. |
 | `OpenRouter.SSE` | An incremental server-sent event decoder. |
+| `OpenRouter.Wire` | HTTP methods, form parts, transport failures. |
 | `OpenRouter.HTTP` | The libcurl binding, and base64 and WAV file helpers. |
 
 `idris2 --mkdoc openrouter.ipkg` builds the API reference from the doc comments.
 
 ## Examples
 
-`examples/` has nine programs: `Hello`, `Stream`, `Tools`, `Structured`, `Chat` (a
+`examples/` has twelve programs: `Hello`, `Stream`, `Tools`, `Structured`, `Chat` (a
 terminal chat that keeps the conversation), `Parallel` (several questions at once),
-`Image` (makes a picture and saves it), `Speech` (reads a sentence aloud, then
-transcribes the recording) and `Models` (the cheapest models that can call tools; needs
-no key).
+`Responses` (the Responses API, streamed and with a tool), `Image` (makes a picture and
+saves it), `Speech` (reads a sentence aloud, then transcribes the recording), `Rerank`,
+and two that need no key: `Models` (the cheapest models that can call tools) and
+`Endpoints` (the generated functions).
 
 ```sh
 export OPENROUTER_API_KEY=sk-or-...
@@ -302,8 +396,8 @@ test/run.sh          # pure tests, then the client against test/mock.py
 test/run.sh --live   # also openrouter.ai: the public endpoints, and paid requests if a key is set
 ```
 
-The pure tests cover the JSON parser and printers, schemas, the wire format of requests,
-response decoding, and the event-stream decoder (including a stream cut in two at every
+The pure tests cover the JSON parser and printers, schemas, the wire format of every kind
+of request, response decoding, and the event-stream decoder (including a stream cut in two at every
 possible position). The mock tests cover every client function against a local server
 that misbehaves on purpose: rate limits with `Retry-After`, provider errors hidden in a
 200, repeated 503s, bodies that are not JSON, timeouts, streams cut mid-line and
@@ -314,15 +408,19 @@ Neither needs a key.
 
 ## Status and limits
 
-- **Tested against openrouter.ai** with a handful of models (`openai/gpt-4o-mini`,
-  `openai/gpt-5-nano`, `openai/gpt-audio-mini`, `google/gemini-2.5-flash-image`, and one
-  model each for embeddings, images, speech and transcription): chat, streaming, a tool
-  loop, a streamed tool call, structured output, log probabilities, reasoning, text
-  completions, embeddings, image generation, pictures in chat replies, image and audio
-  input, speech, a spoken chat reply, transcription, concurrent requests, and the key,
-  credits and generation endpoints. Other models and providers are covered only by the mock, which follows
-  OpenRouter's documented shapes. `test/run.sh --live` repeats nearly all of this when
-  `OPENROUTER_API_KEY` is set, for about a cent.
+- **Tested against openrouter.ai** with a handful of models: chat, streaming, tool loops,
+  structured output, log probabilities, reasoning, server tools, the Responses API
+  (plain, streamed, tools, typed), the Anthropic Messages API (plain, streamed, tool use),
+  text completions, embeddings, rerank, image generation, pictures in chat replies, image
+  and audio input, speech, a spoken reply, transcription, file storage, concurrent
+  requests, and the catalog, key, credits and generation endpoints. `test/run.sh --live`
+  repeats this when `OPENROUTER_API_KEY` is set, for about a cent.
+- **Tested only against the mock:** video generation (a real video costs a quarter or
+  more), batches (they need a model with a platform-billed batch endpoint), key
+  management, activity and sign-in (they need a management key or a real user), and the
+  generated functions for the administrative endpoints, of which a sample is exercised to
+  check paths, queries, bodies, uploads and downloads. The mock follows OpenRouter's
+  documented shapes.
 - **Audio formats depend on the provider.** Several speech models refuse
   `SpeechFormat "mp3"`, and OpenAI's audio chat models only stream `"pcm16"`. Free models
   need your account's privacy settings to allow them.
@@ -332,9 +430,10 @@ Neither needs a key.
   `OpenRouter.Async` runs requests on threads of their own; there is no event loop and no
   cancellation. It needs a threaded Chez, which is what Idris is normally built with. A
   stream must be closed (`chatStream` and `chatStreamText` close theirs).
-- Not covered: the Responses and Anthropic Messages endpoints, video generation,
-  streamed partial images from the image endpoint, multipart uploads, API key management,
-  and OAuth. `call` reaches any JSON endpoint.
+- Typed functions stop where the API turns administrative. Guardrails, workspaces,
+  presets, analytics and the like are reached through `OpenRouter.API`, with JSON in and
+  out. Streamed partial images from the image endpoint are reached with
+  `openEventStream`.
 
 ## License
 

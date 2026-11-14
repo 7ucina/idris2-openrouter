@@ -49,6 +49,8 @@ record Delta where
   audioData          : String
   ||| More of what is being said, or `""`.
   audioTranscript    : String
+  ||| Sources the reply cites.
+  citations          : List Citation
 
 public export
 record Chunk where
@@ -88,6 +90,7 @@ deltaFromJSON j =
         (imageURLs (get "images" d))
         (fromMaybe "" (asString (path ["audio", "data"] d)))
         (fromMaybe "" (asString (path ["audio", "transcript"] d)))
+        (citationsFromJSON (get "annotations" d))
 
 export
 chunkFromJSON : JSON -> Chunk
@@ -134,6 +137,7 @@ record PartialChoice where
   images    : SnocList String
   audio     : SnocList String
   spoken    : SnocList String
+  cited     : SnocList Citation
 
 ||| Everything a stream has said so far.
 export
@@ -178,7 +182,7 @@ addCall calls d =
 
 addDelta : List PartialChoice -> Delta -> List PartialChoice
 addDelta choices d =
-  upsert (.index) (\n => MkPartialChoice n [<] [<] [] Nothing Nothing [<] [<] [<] [<] [<]) d.index
+  upsert (.index) (\n => MkPartialChoice n [<] [<] [] Nothing Nothing [<] [<] [<] [<] [<] [<]) d.index
     (\c => { content   $= (:< d.content)
            , reasoning $= (:< d.reasoning)
            , calls     := foldl addCall c.calls d.toolCalls
@@ -188,7 +192,8 @@ addDelta choices d =
            , details   $= (<>< d.reasoningDetails)
            , images    $= (<>< d.images)
            , audio     $= (:< d.audioData)
-           , spoken    $= (:< d.audioTranscript) } c)
+           , spoken    $= (:< d.audioTranscript)
+           , cited     $= (<>< d.citations) } c)
     choices
 
 ||| Add a chunk.
@@ -223,6 +228,7 @@ finishChoice c =
         (c.logprobs <>> [])
         (c.images <>> [])
         (if audio == "" && spoken == "" then Nothing else Just (MkSpokenAudio audio spoken))
+        (c.cited <>> [])
         JNull
 
 ||| The response the chunks so far add up to.

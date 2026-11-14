@@ -31,6 +31,7 @@ typedef struct or_req {
   struct curl_slist *headers;
   char              *body;     // request body, kept alive for the transfer
   FILE              *file;     // where or_save_run writes
+  curl_mime         *form;     // a multipart body under construction
   buf                in;       // response bytes received, not yet handed out
   buf                out;      // the piece last handed out
   buf                rh;       // response headers, "name: value\n" each
@@ -128,6 +129,30 @@ void or_body(or_req *r, const char *body) {
   curl_easy_setopt(r->easy, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)strlen(r->body));
 }
 
+// A multipart/form-data body, built one part at a time: a text field, or a
+// file read from disk when the request is sent. filename and type may be ""
+// to let libcurl choose (the file's own name; a type guessed from it).
+void or_form_field(or_req *r, const char *name, const char *value) {
+  if (!r->form) r->form = curl_mime_init(r->easy);
+  if (!r->form) return;
+  curl_mimepart *part = curl_mime_addpart(r->form);
+  if (!part) return;
+  curl_mime_name(part, name);
+  curl_mime_data(part, value, CURL_ZERO_TERMINATED);
+}
+
+void or_form_file(or_req *r, const char *name, const char *path, const char *filename,
+                  const char *type) {
+  if (!r->form) r->form = curl_mime_init(r->easy);
+  if (!r->form) return;
+  curl_mimepart *part = curl_mime_addpart(r->form);
+  if (!part) return;
+  curl_mime_name(part, name);
+  curl_mime_filedata(part, path);
+  if (filename[0]) curl_mime_filename(part, filename);
+  if (type[0]) curl_mime_type(part, type);
+}
+
 // connect_ms: time allowed to connect. total_ms: time allowed for the whole
 // request. idle_ms: give up when nothing arrives for this long. 0 turns one off.
 void or_timeouts(or_req *r, int connect_ms, int total_ms, int idle_ms) {
@@ -178,6 +203,7 @@ static void pump(or_req *r, size_t have) {
 int or_start(or_req *r) {
   or_header(r, "Expect:");  // never wait for a 100 Continue before sending the body
   if (r->headers) curl_easy_setopt(r->easy, CURLOPT_HTTPHEADER, r->headers);
+  if (r->form) curl_easy_setopt(r->easy, CURLOPT_MIMEPOST, r->form);
   r->mcode = curl_multi_add_handle(r->multi, r->easy);
   if (r->mcode != CURLM_OK) {
     r->done = 1;
@@ -315,6 +341,7 @@ void or_free(or_req *r) {
   if (r->added) curl_multi_remove_handle(r->multi, r->easy);
   curl_easy_cleanup(r->easy);
   curl_multi_cleanup(r->multi);
+  if (r->form) curl_mime_free(r->form);  // only once the handle that used it is gone
   curl_slist_free_all(r->headers);
   if (r->file) fclose(r->file);
   free(r->body);

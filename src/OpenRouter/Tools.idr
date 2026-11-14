@@ -88,7 +88,7 @@ runTools c handlers maxRounds request =
 ||| The tokens and the cost of a whole tool run.
 export
 totalUsage : ToolRun -> Usage
-totalUsage run = foldl plus (MkUsage 0 0 0 Nothing Nothing Nothing JNull) (mapMaybe usage run.responses)
+totalUsage run = foldl plus (MkUsage 0 0 0 Nothing Nothing Nothing Nothing JNull) (mapMaybe usage run.responses)
   where
     both : Num a => Maybe a -> Maybe a -> Maybe a
     both (Just x) (Just y) = Just (x + y)
@@ -101,5 +101,6 @@ totalUsage run = foldl plus (MkUsage 0 0 0 Nothing Nothing Nothing JNull) (mapMa
       (a.totalTokens + b.totalTokens)
       (both a.reasoningTokens b.reasoningTokens)
       (both a.cachedTokens b.cachedTokens)
+      (both a.cacheWriteTokens b.cacheWriteTokens)
       (both a.cost b.cost)
       JNull

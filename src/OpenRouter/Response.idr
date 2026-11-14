@@ -95,13 +95,14 @@ embeddedError j = case get "error" j of
   e     => Just (errorFromJSON 200 Nothing e)
 
 ||| Turn a status and a body into the JSON of a successful response, or the
-||| error. An error body counts as an error whatever the status: OpenRouter
+||| error. An error object counts as an error whatever the status: OpenRouter
 ||| answers 200 when a provider fails after the response has begun.
 export
 interpret : (status : Int) -> (retryAfter : Maybe Nat) -> (body : String) -> Either Error JSON
 interpret status after body =
   let ok = status >= 200 && status < 300
-   in case parse body of
+   in if ok && trim body == "" then Right JNull   -- a success with nothing to say
+      else case parse body of
         Left e =>
           if ok then Left (Malformed (show e) body)
           else Left (Api (MkApiError status
@@ -110,7 +111,14 @@ interpret status after body =
         Right j => case get "error" j of
           JNull => if ok then Right j
                    else Left (Api (MkApiError status (clip 500 body) Nothing JNull after))
-          e     => Left (Api (errorFromJSON status after e))
+          e     =>
+            -- Inside a success, only an error object counts: a job that
+            -- failed reports why in an `error` string, and is still an answer.
+            if ok && not (isErrorObject e) then Right j
+            else Left (Api (errorFromJSON status after e))
+  where
+    isErrorObject : JSON -> Bool
+    isErrorObject e = not (isNull (get "message" e)) || not (isNull (get "code" e))
 
 --------------------------------------------------------------------------------
 -- Usage
@@ -126,6 +134,8 @@ record Usage where
   reasoningTokens  : Maybe Nat
   ||| The part of `promptTokens` read from a cache, when reported.
   cachedTokens     : Maybe Nat
+  ||| The part of `promptTokens` written to a cache, when reported.
+  cacheWriteTokens : Maybe Nat
   ||| What the request cost, in credits (US dollars).
   cost             : Maybe Double
   raw              : JSON
@@ -139,6 +149,7 @@ usageFromJSON j = Just $ MkUsage
   (fromMaybe 0 (asNat (get "total_tokens" j)))
   (asNat (path ["completion_tokens_details", "reasoning_tokens"] j))
   (asNat (path ["prompt_tokens_details", "cached_tokens"] j))
+  (asNat (path ["prompt_tokens_details", "cache_write_tokens"] j))
   (asDouble (get "cost" j))
   j
 
@@ -203,6 +214,32 @@ logprobsFromJSON j = mapMaybe one (asList (get "content" j))
     one t = [| MkTokenLogprob (asString (get "token" t)) (asDouble (get "logprob" t))
                               (pure (mapMaybe alt (asList (get "top_logprobs" t)))) |]
 
+||| A source a model cited, from a web search or a file.
+public export
+record Citation where
+  constructor MkCitation
+  url   : String
+  title : Maybe String
+  ||| The stretch of the reply's text the citation supports, as character
+  ||| offsets, when given.
+  span  : Maybe (Nat, Nat)
+
+||| The URL citations in a message's or a content part's `annotations`.
+export
+citationsFromJSON : JSON -> List Citation
+citationsFromJSON = mapMaybe one . asList
+  where
+    one : JSON -> Maybe Citation
+    one a =
+      -- chat nests the fields under "url_citation"; the Responses API does not
+      let c = case get "url_citation" a of
+                JNull => a
+                inner => inner
+       in if asString (get "type" a) /= Just "url_citation" then Nothing
+          else (\u => MkCitation u (asString (get "title" c))
+                        [| MkPair (asNat (get "start_index" c)) (asNat (get "end_index" c)) |])
+                 <$> asString (get "url" c)
+
 ||| Audio a chat model spoke.
 public export
 record SpokenAudio where
@@ -231,6 +268,8 @@ record Choice where
   images             : List String
   ||| What the model spoke, when the request asked for audio.
   audio              : Maybe SpokenAudio
+  ||| The sources the reply cites, when the model searched the web.
+  citations          : List Citation
   ||| The choice as it arrived; `JNull` when it was assembled from a stream.
   raw                : JSON
 
@@ -261,6 +300,7 @@ choiceFromJSON j =
         (logprobsFromJSON (get "logprobs" j))
         (imageURLs (get "images" m))
         (spokenAudio (get "audio" m))
+        (citationsFromJSON (get "annotations" m))
         j
 
 public export
@@ -326,6 +366,11 @@ reasoningText r = fromMaybe "" (firstChoice r >>= reasoning)
 export
 replyImages : ChatResponse -> List String
 replyImages r = maybe [] images (firstChoice r)
+
+||| The sources the reply cites.
+export
+replyCitations : ChatResponse -> List Citation
+replyCitations r = maybe [] citations (firstChoice r)
 
 ||| The audio of the reply, when the request asked for one.
 export
@@ -494,3 +539,103 @@ transcriptionFromJSON j = MkTranscription
   where
     segment : JSON -> Maybe Segment
     segment s = [| MkSegment (asDouble (get "start" s)) (asDouble (get "end" s)) (asString (get "text" s)) |]
+
+--------------------------------------------------------------------------------
+-- Rerank responses
+--------------------------------------------------------------------------------
+
+public export
+record RerankResult where
+  constructor MkRerankResult
+  ||| Which of the request's documents this is, counting from 0.
+  index    : Nat
+  ||| How well it answers the query; higher is better.
+  score    : Double
+  document : Maybe String
+
+public export
+record RerankResponse where
+  constructor MkRerankResponse
+  model   : String
+  ||| The documents, best first.
+  results : List RerankResult
+  cost    : Maybe Double
+  raw     : JSON
+
+export
+rerankResponseFromJSON : JSON -> RerankResponse
+rerankResponseFromJSON j = MkRerankResponse
+  (fromMaybe "" (asString (get "model" j)))
+  (mapMaybe one (asList (get "results" j)))
+  (asDouble (path ["usage", "cost"] j))
+  j
+  where
+    one : JSON -> Maybe RerankResult
+    one r = [| MkRerankResult (asNat (get "index" r)) (asDouble (get "relevance_score" r))
+                              (pure (asString (path ["document", "text"] r) <|> asString (get "document" r))) |]
+
+--------------------------------------------------------------------------------
+-- Video jobs
+--------------------------------------------------------------------------------
+
+public export
+data JobStatus = Pending | InProgress | Completed | Failed | Cancelled | Expired | OtherStatus String
+
+export
+Show JobStatus where
+  show Pending         = "pending"
+  show InProgress      = "in_progress"
+  show Completed       = "completed"
+  show Failed          = "failed"
+  show Cancelled       = "cancelled"
+  show Expired         = "expired"
+  show (OtherStatus s) = s
+
+export
+Eq JobStatus where
+  a == b = show a == show b
+
+export
+parseJobStatus : String -> JobStatus
+parseJobStatus "pending"     = Pending
+parseJobStatus "validating"  = Pending
+parseJobStatus "in_progress" = InProgress
+parseJobStatus "finalizing"  = InProgress
+parseJobStatus "cancelling"  = InProgress
+parseJobStatus "completed"   = Completed
+parseJobStatus "failed"      = Failed
+parseJobStatus "cancelled"   = Cancelled
+parseJobStatus "expired"     = Expired
+parseJobStatus s             = OtherStatus s
+
+||| Whether a job has stopped, for better or worse.
+export
+finished : JobStatus -> Bool
+finished Pending    = False
+finished InProgress = False
+finished _          = True
+
+||| A video being made, or made.
+public export
+record VideoJob where
+  constructor MkVideoJob
+  id     : String
+  status : JobStatus
+  ||| Where the finished videos are, once the job has completed.
+  urls   : List String
+  ||| Why the job failed, when it did.
+  error  : Maybe String
+  cost   : Maybe Double
+  raw    : JSON
+
+export
+videoJobFromJSON : JSON -> VideoJob
+videoJobFromJSON j = MkVideoJob
+  (fromMaybe "" (asString (get "id" j)))
+  (maybe (OtherStatus "") parseJobStatus (asString (get "status" j)))
+  (case asStrings (get "unsigned_urls" j) of
+     [] => asStrings (get "urls" j)
+     us => us)
+  (asString (get "error" j))
+  (asDouble (path ["usage", "cost"] j))
+  j

@@ -1,5 +1,5 @@
 package openrouter
-version    = 0.3.0
+version    = 0.4.0
 brief      = "A client for the OpenRouter API: chat, streaming, typed tools and structured output"
 authors    = "Belphegor"
 license    = "MIT"
@@ -11,6 +11,8 @@ sourcedir  = "src"
 depends    = base >= 0.7.0
 
 modules    = OpenRouter
+           , OpenRouter.API
+           , OpenRouter.Anthropic
            , OpenRouter.Async
            , OpenRouter.Client
            , OpenRouter.HTTP
@@ -19,10 +21,12 @@ modules    = OpenRouter
            , OpenRouter.Model
            , OpenRouter.Request
            , OpenRouter.Response
+           , OpenRouter.Responses
            , OpenRouter.SSE
            , OpenRouter.Schema
            , OpenRouter.Stream
            , OpenRouter.Tools
+           , OpenRouter.Wire
 
 -- Builds support/openrouter_curl.c into lib/, which is installed with the package.
 prebuild   = "make -C support"

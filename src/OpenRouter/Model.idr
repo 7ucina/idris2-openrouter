@@ -141,11 +141,17 @@ providerInfoFromJSON j = MkProviderInfo
 -- The account
 --------------------------------------------------------------------------------
 
-||| The API key in use. Amounts are in credits (US dollars).
+||| An API key: the one in use, or one a management key looks after. Amounts
+||| are in credits (US dollars).
 public export
 record KeyInfo where
   constructor MkKeyInfo
   label          : String
+  ||| The key's name, as given when it was made.
+  name           : Maybe String
+  ||| What the management endpoints know the key by.
+  hash           : Maybe String
+  disabled       : Bool
   ||| What the key has spent.
   usage          : Maybe Double
   ||| The key's spending limit; `Nothing` when it has none.
@@ -158,6 +164,9 @@ export
 keyInfoFromJSON : JSON -> KeyInfo
 keyInfoFromJSON j = MkKeyInfo
   (fromMaybe "" (asString (get "label" j)))
+  (asString (get "name" j))
+  (asString (get "hash" j))
+  (fromMaybe False (asBool (get "disabled" j)))
   (asAmount (get "usage" j))
   (asAmount (get "limit" j))
   (asAmount (get "limit_remaining" j))
@@ -217,3 +226,91 @@ generationFromJSON j = MkGeneration
   (fromMaybe False (asBool (get "streamed" j)))
   (fromMaybe False (asBool (get "cancelled" j)))
   j
+
+--------------------------------------------------------------------------------
+-- Files and batches
+--------------------------------------------------------------------------------
+
+||| A file stored with OpenRouter, to refer to in later requests.
+public export
+record FileInfo where
+  constructor MkFileInfo
+  id        : String
+  filename  : String
+  mediaType : Maybe String
+  ||| The file's size in bytes.
+  size      : Maybe Nat
+  ||| Whether its content can be downloaded: only files made on the server can.
+  downloadable : Bool
+  raw       : JSON
+
+export
+fileInfoFromJSON : JSON -> FileInfo
+fileInfoFromJSON j = MkFileInfo
+  (fromMaybe "" (asString (get "id" j)))
+  (fromMaybe "" (asString (get "filename" j)))
+  (asString (get "mime_type" j))
+  (asNat (get "size_bytes" j) <|> asNat (get "bytes" j))
+  (fromMaybe False (asBool (get "downloadable" j)))
+  j
+
+||| One request of a batch, under an id of your choosing that its result
+||| will carry. `body` is the request as the batch's endpoint takes it:
+||| `toJSON` of a `ChatRequest`, say.
+public export
+record BatchItem where
+  constructor MkBatchItem
+  customId : String
+  body     : JSON
+
+||| The outcome of one request of a batch.
+public export
+record BatchResult where
+  constructor MkBatchResult
+  customId : String
+  ||| The response's body, as the endpoint would have returned it; `JNull`
+  ||| when the request failed.
+  body     : JSON
+  ||| Why the request failed, when it did.
+  error    : Maybe String
+
+||| A batch of requests running in the background, at a discount.
+public export
+record Batch where
+  constructor MkBatch
+  id        : String
+  ||| `"validating"`, `"in_progress"`, `"finalizing"`, `"completed"`,
+  ||| `"failed"`, `"expired"`, `"cancelling"` or `"cancelled"`.
+  status    : String
+  endpoint  : String
+  model     : String
+  requests  : Nat
+  completed : Nat
+  failed    : Nat
+  ||| The results, once the batch has completed.
+  results   : List BatchResult
+  raw       : JSON
+
+export
+batchFromJSON : JSON -> Batch
+batchFromJSON j = MkBatch
+  (fromMaybe "" (asString (get "id" j)))
+  (fromMaybe "" (asString (get "status" j)))
+  (fromMaybe "" (asString (get "endpoint" j)))
+  (fromMaybe "" (asString (get "model" j)))
+  (fromMaybe 0 (asNat (path ["request_counts", "total"] j)))
+  (fromMaybe 0 (asNat (path ["request_counts", "completed"] j)))
+  (fromMaybe 0 (asNat (path ["request_counts", "failed"] j)))
+  (map result (asList (get "results" j)))
+  j
+  where
+    result : JSON -> BatchResult
+    result r = MkBatchResult
+      (fromMaybe "" (asString (get "custom_id" r)))
+      (path ["response", "body"] r)
+      (asString (path ["error", "message"] r))
+
+||| Whether a batch has stopped, for better or worse.
+export
+batchFinished : Batch -> Bool
+batchFinished b = elem b.status ["completed", "failed", "expired", "cancelled"]

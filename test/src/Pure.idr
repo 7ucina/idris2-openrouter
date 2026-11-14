@@ -335,6 +335,95 @@ mediaTests = do
     (map (\a => (a.base64, a.transcript)) (replyAudio s), replyImages s)
     (Just ("UklGAAA=", "Hello"), ["data:image/png;base64,AA"])
 
+moreTests : Tally => IO ()
+moreTests = do
+  section "The other request shapes"
+  same "the newer chat options"
+    (render (toJSON (chatRequest "m" []
+       [ SessionId "s1", Metadata [("a", "b")], ServiceTier "flex", Prediction "old text", PromptCacheKey "k", AutoCache True
+       , EchoUpstream True, Reasoning [Effort Max], ResponseFormat (Grammar "root ::= x")
+       , Provider [MinThroughput 50, MaxLatency 2.5] ])))
+    (#"{"model":"m","messages":[],"session_id":"s1","metadata":{"a":"b"},"service_tier":"flex","#
+      ++ #""prediction":{"type":"content","content":"old text"},"prompt_cache_key":"k","cache_control":{"type":"ephemeral"},"#
+      ++ #""debug":{"echo_upstream_body":true},"reasoning":{"effort":"max"},"response_format":{"type":"grammar","grammar":"root ::= x"},"#
+      ++ #""provider":{"preferred_min_throughput":50.0,"preferred_max_latency":2.5}}"#)
+  same "function tools and server tools share one array"
+    (render (toJSON (chatRequest "m" [] [Tools [tool "f" "d" boolean], Temperature 1, ServerTools [serverTool "openrouter:web_search" [("max_results", JInt 3)]]])))
+    (#"{"model":"m","messages":[],"tools":[{"type":"function","function":{"name":"f","description":"d","parameters":{"type":"boolean"}}},"#
+      ++ #"{"type":"openrouter:web_search","max_results":3}],"temperature":1.0}"#)
+  same "server tools alone" (render (toJSON (chatRequest "m" [] [ServerTools [serverTool "openrouter:datetime" []]])))
+    #"{"model":"m","messages":[],"tools":[{"type":"openrouter:datetime"}]}"#
+  same "a video part" (render (toJSON (userParts [Video "https://x/v.mp4"])))
+    #"{"role":"user","content":[{"type":"video_url","video_url":{"url":"https://x/v.mp4"}}]}"#
+  same "rerank and video requests"
+    (render (toJSON (rerankRequest "r" "q" ["a", "b"] [TopN 1])) ++ render (toJSON (videoRequest "v" "a cat" [Duration 5, AspectRatio "16:9", GenerateAudio True])))
+    #"{"model":"r","query":"q","documents":["a","b"],"top_n":1}{"model":"v","prompt":"a cat","duration":5,"aspect_ratio":"16:9","generate_audio":true}"#
+
+  same "a Responses request: items, flat tools, translated options"
+    (render (toJSON (responsesRequest "m"
+       [ say System "Be brief.", SayParts User [Text "Look", Image "https://x/i.png"], FunctionCall "c1" "f" "{}", FunctionOutput "c1" "42" ]
+       [ Instructions "Be kind.", MaxTokens 100, Tools [strictTool (tool "f" "d" boolean)], ToolChoice (Function "f")
+       , ResponseFormat (schemaFormat "n" integer), Reasoning [Effort Low], Temperature 0.5 ])))
+    (#"{"model":"m","input":[{"type":"message","role":"system","content":"Be brief."},"#
+      ++ #"{"type":"message","role":"user","content":[{"type":"input_text","text":"Look"},{"type":"input_image","image_url":"https://x/i.png","detail":"auto"}]},"#
+      ++ #"{"type":"function_call","call_id":"c1","name":"f","arguments":"{}"},{"type":"function_call_output","call_id":"c1","output":"42"}],"#
+      ++ #""instructions":"Be kind.","max_output_tokens":100,"tool_choice":{"type":"function","name":"f"},"#
+      ++ #""text":{"format":{"type":"json_schema","name":"n","strict":true,"schema":{"type":"integer"}}},"reasoning":{"effort":"low"},"temperature":0.5,"#
+      ++ #""tools":[{"type":"function","name":"f","description":"d","parameters":{"type":"boolean"},"strict":true}]}"#)
+  let r = modelResponseFromJSON (parsed #"{"id":"r1","model":"m","status":"completed","output":[{"type":"reasoning","summary":[{"type":"summary_text","text":"Hm."}]},{"type":"message","content":[{"type":"output_text","text":"Hi ","annotations":[{"type":"url_citation","url":"https://a","title":"A","start_index":0,"end_index":2}]},{"type":"output_text","text":"there"}]},{"type":"function_call","call_id":"c1","name":"f","arguments":"{\"x\":1}"},{"type":"image_generation_call","result":"AAAA"},{"type":"message","content":[{"type":"refusal","refusal":"No."}]}],"usage":{"input_tokens":5,"output_tokens":7,"total_tokens":12,"output_tokens_details":{"reasoning_tokens":2},"input_tokens_details":{"cached_tokens":1},"cost":0.5}}"#)
+  same "a Responses result: text, reasoning, calls, citations"
+    (outputText r, outputReasoning r, map (\c => (c.id, c.name, c.arguments)) (functionCalls r), map (\c => (c.url, c.title, c.span)) (outputCitations r))
+    ("Hi there", "Hm.", [("c1", "f", #"{"x":1}"#)], [("https://a", Just "A", Just (0, 2))])
+  same "its other items are kept by type"
+    (map (\o => case o of { OtherOutput t _ => t; OutputRefusal x => "refusal:" ++ x; _ => "-" }) r.output)
+    ["-", "-", "-", "image_generation_call", "refusal:No."]
+  same "its usage, in the usual terms"
+    (map (\u => (u.promptTokens, u.completionTokens, u.totalTokens, u.reasoningTokens, u.cachedTokens, u.cost)) r.usage)
+    (Just (5, 7, 12, Just 2, Just 1, Just 0.5))
+  same "its output goes back in as input" (length (outputItems r), render (toJSON (take 1 (drop 2 (outputItems r)))))
+    (5, #"[{"type":"function_call","call_id":"c1","name":"f","arguments":"{\"x\":1}"}]"#)
+  same "stream events are told apart"
+    (map (\j => case responseEventFromJSON (parsed j) of
+             TextDelta t => "text:" ++ t; ReasoningDelta t => "reasoning:" ++ t; ArgumentsDelta t => "args:" ++ t
+             ItemDone (OutputMessage t _) => "item:" ++ t; ItemDone _ => "item"; OtherEvent t _ => "other:" ++ t)
+       [ #"{"type":"response.output_text.delta","delta":"a"}"#, #"{"type":"response.reasoning_summary_text.delta","delta":"b"}"#
+       , #"{"type":"response.function_call_arguments.delta","delta":"c"}"#
+       , #"{"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"d"}]}}"#
+       , #"{"type":"response.created"}"# ])
+    ["text:a", "reasoning:b", "args:c", "item:d", "other:response.created"]
+
+  same "a Messages request: blocks, system, translated options"
+    (render (toJSON (messagesRequest "m" 256
+       [ userTurn "Hi", MkTurn Assistant [Thinking "t" "sig", ToolUse "tu1" "f" (JObject [("x", JInt 1)])]
+       , MkTurn User [ToolOutput "tu1" "42" False, ToolOutput "tu2" "boom" True, ImageBlock "image/png" "AAAA"] ]
+       [ Instructions "Be brief.", Stop ["END"], Tools [tool "f" "d" boolean], ToolChoice Required, Reasoning [Budget 1024], TopK 5 ])))
+    (#"{"model":"m","max_tokens":256,"messages":[{"role":"user","content":[{"type":"text","text":"Hi"}]},"#
+      ++ #"{"role":"assistant","content":[{"type":"thinking","thinking":"t","signature":"sig"},{"type":"tool_use","id":"tu1","name":"f","input":{"x":1}}]},"#
+      ++ #"{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu1","content":"42"},{"type":"tool_result","tool_use_id":"tu2","content":"boom","is_error":true},"#
+      ++ #"{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}],"#
+      ++ #""system":"Be brief.","stop_sequences":["END"],"tool_choice":{"type":"any"},"thinking":{"type":"enabled","budget_tokens":1024},"top_k":5,"#
+      ++ #""tools":[{"name":"f","description":"d","input_schema":{"type":"boolean"}}]}"#)
+  let a = messagesResponseFromJSON (parsed #"{"id":"m1","model":"m","content":[{"type":"thinking","thinking":"Hm","signature":"s"},{"type":"text","text":"Hi"},{"type":"tool_use","id":"tu1","name":"f","input":{"x":1}},{"type":"server_tool_use"}],"stop_reason":"tool_use","usage":{"input_tokens":3,"output_tokens":4,"cache_read_input_tokens":1}}"#)
+  same "a Messages result" (blocksText a.content, map (\c => (c.id, c.name, c.arguments)) (toolUses a.content), a.stopReason, length a.content)
+    ("Hi", [("tu1", "f", #"{"x":1}"#)], Just "tool_use", 4)
+  same "its usage" (map (\u => (u.promptTokens, u.completionTokens, u.totalTokens, u.cachedTokens)) a.usage) (Just (3, 4, 7, Just 1))
+  same "its reply goes back as a turn" (render (toJSON (replyTurn a)) == render (JObject [("role", JString "assistant"), ("content", get "content" a.raw)])) True
+
+  let rr = rerankResponseFromJSON (parsed #"{"model":"r","results":[{"index":1,"relevance_score":0.9,"document":{"text":"b"}},{"index":0,"relevance_score":0.1}],"usage":{"cost":0.002}}"#)
+  same "a rerank result" (map (\x => (x.index, x.score, x.document)) rr.results, rr.cost) ([(1, 0.9, Just "b"), (0, 0.1, Nothing)], Just 0.002)
+  let v = videoJobFromJSON (parsed #"{"id":"j1","status":"completed","urls":["signed"],"unsigned_urls":["plain"],"usage":{"cost":0.25}}"#)
+  same "a video job" (v.id, v.status, v.urls, v.cost, finished v.status, finished InProgress) ("j1", Completed, ["plain"], Just 0.25, True, False)
+  let b = batchFromJSON (parsed #"{"id":"b1","status":"completed","endpoint":"/v1/chat/completions","model":"m","request_counts":{"total":2,"completed":1,"failed":1},"results":[{"custom_id":"a","response":{"body":{"x":1}},"error":null},{"custom_id":"b","response":null,"error":{"message":"bad"}}]}"#)
+  same "a batch" (b.requests, b.completed, b.failed, map (\x => (x.customId, render x.body, x.error)) b.results, batchFinished b)
+    (2, 1, 1, [("a", #"{"x":1}"#, Nothing), ("b", "null", Just "bad")], True)
+  same "citations in a chat reply"
+    (map (\c => (c.url, c.title)) (replyCitations (chatResponseFromJSON (parsed #"{"choices":[{"message":{"content":"x","annotations":[{"type":"url_citation","url_citation":{"url":"https://a","title":"A"}},{"type":"file"}]}}]}"#))))
+    [("https://a", Just "A")]
+  same "a job that failed is still an answer" (describeError (interpret 200 Nothing #"{"id":"j","status":"failed","error":"Prompt was refused"}"#)) "ok"
+  same "an empty success is null" (map render (mapFst (const ()) (interpret 204 Nothing ""))) (Right "null")
+  same "the sign-in URL" (authorizationURL "https://my.app/cb?x=1" (Just ("abc", "S256")))
+    "https://openrouter.ai/auth?callback_url=https%3A%2F%2Fmy.app%2Fcb%3Fx%3D1&code_challenge=abc&code_challenge_method=S256"
+
 --------------------------------------------------------------------------------
 -- Server-sent events
 --------------------------------------------------------------------------------
@@ -425,5 +514,6 @@ pureTests = do
   requestTests
   responseTests
   mediaTests
+  moreTests
   sseTests
   streamTests
